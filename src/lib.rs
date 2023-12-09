@@ -3,7 +3,6 @@ rust-workshop is a task processing crate, for when makefile, justfile, or whatev
 */
 
 
-
 use core::fmt::Display;
 
 use std::error::Error;
