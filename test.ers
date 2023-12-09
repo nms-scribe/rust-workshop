@@ -78,7 +78,7 @@ fn main() -> Result<(),Box<dyn Error>> {
     workshop.add("test-skipping", task!{
         help: "Test if skipping works.",
         dependencies: &["transform-file"],
-        skip_if_olderthan: (&["test_one.txt"],&["test_two.txt"]),
+        skip_if_older_than: (&["test_one.txt"],&["test_two.txt"]),
         function: || Err("test-skipping should have been skipped".into()),
     })?;
 

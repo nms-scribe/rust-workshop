@@ -307,7 +307,7 @@ impl Task {
     }
 
     /// Tells the task that it should skip if the files in `source` are older than the files in `target`. See [Skip::IfOlderThan].
-    pub fn skip_if_olderthan<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
+    pub fn skip_if_older_than<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
         let source = source.iter().map(|path| path.clone().into()).collect();
         let target = target.iter().map(|path| path.clone().into()).collect();
         self.skip = Some(Skip::IfOlderThan { source, target });
@@ -328,8 +328,8 @@ impl Task {
 #[macro_export]
 /// The task macro allows you to use something like a struct-constructor syntax to create a task. A 'help' property is the only one required. The other available properties are the same as the methods on [Task], and the values are passed to those functions. The `skip_if_older_than` method can be used by wrapping the two arguments in parentheses, like a tuple.
 macro_rules! task {
-    (@key $task: ident, skip_if_olderthan: $value: expr) => {
-        $task.skip_if_olderthan($value.0,$value.1)
+    (@key $task: ident, skip_if_older_than: $value: expr) => {
+        $task.skip_if_older_than($value.0,$value.1)
     };
     (@key $task: ident, $key: ident $(: $value: expr)?) => {
         $task.$key($($value)?)
