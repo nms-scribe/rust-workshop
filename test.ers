@@ -1,0 +1,108 @@
+#!/usr/bin/env -S rust-script --base-path ${PWD} --force --cargo-output
+//! This is a regular crate doc comment, but it also contains a partial
+//! Cargo manifest.  Note the use of a *fenced* code block, and the
+//! `cargo` "language".
+//!
+//! ```cargo
+//! [dependencies]
+//! rust-workshop = { path = "."}
+//! ```
+
+use rust_workshop::Workshop;
+use rust_workshop::duct::cmd;
+use rust_workshop::task;
+use std::error::Error;
+
+
+fn main() -> Result<(),Box<dyn Error>> {
+
+    let mut workshop = Workshop::new();
+
+    workshop.add("2", task!{
+        help: "Line One",
+        command: cmd!("echo","Whereas recognition of the inherent"),
+    })?;
+
+    workshop.add("3", task!{
+        help: "Echo Three",
+        dependencies: &["10","8"],
+        command: cmd!("echo","3"),
+    })?;
+
+    workshop.add("5", task!{
+        help: "Line Five",
+        dependency: "11",
+        command: cmd!("echo","foundation of freedom, justice and"),
+    })?;
+    
+    workshop.add("7", task!{
+        help: "Echo Seven",
+        dependencies: &["11","8"],
+        command: cmd!("echo","7"),
+    })?;
+
+    workshop.add("8", task!{
+        help: "Line Six",
+        dependencies: &["9"],
+        command: cmd!("echo","peace in the world...")
+    })?;
+
+    workshop.add("9", task!{
+        help: "Line Two",
+        command: cmd!("echo","dignity and of the equal and"),
+    })?;
+
+    workshop.add("10", task!{
+        help: "Line Three",
+        command: cmd!("echo","inalienable rights of all members"),
+    })?;
+
+    workshop.add("11", task!{
+        help: "Line Four",
+        dependencies: &["2","9","10"],
+        command: cmd!("echo","of the human family is the"),
+    })?;
+
+    workshop.add("create-file", task!{
+        help: "Create the file that needs to be created.",
+        command: cmd!("echo","Hello, World").stdout_path("test_one.txt"),
+    })?;
+
+    workshop.add("transform-file", task!{
+        help: "Transform the file.",
+        dependencies: &["create-file"],
+        command: cmd!("sleep","0.2"), // ensures that there is a delay in the time, so skipping works.
+        command: cmd!("cp","test_one.txt","test_two.txt"),
+    })?;
+
+    workshop.add("test-skipping", task!{
+        help: "Test if skipping works.",
+        dependencies: &["transform-file"],
+        skip_if_olderthan: (&["test_one.txt"],&["test_two.txt"]),
+        function: || Err("test-skipping should have been skipped".into()),
+    })?;
+
+    workshop.add("test-glob", task!{
+        help: "Test if glob star expressions work.",
+        function: || {
+            let cargo_files = Workshop::glob_to_osstrings(&["Cargo.*"])?;
+            let cmd = cmd("ls",cargo_files);
+            let output = cmd.read()?;
+            let output = output.split('\n').collect::<Vec<_>>();
+            if output.len() == 2 && output.contains(&"Cargo.toml") && output.contains(&"Cargo.lock") {
+                Ok(())
+            } else {
+                Err(format!("test-glob returned invalid data from 'ls': {}",output.join("\n")).into())
+            }
+        },
+    })?;
+
+
+
+    workshop.add("default", task!{
+        help: "Default task",
+        dependencies: &["5","8","test-skipping","test-glob"],
+    })?;
+
+    workshop.main()
+}
