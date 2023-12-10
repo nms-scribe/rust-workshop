@@ -5,24 +5,24 @@ rust-workshop is a task processing crate, for when makefile, justfile, or whatev
 
 use core::fmt::Display;
 
-use std::error::Error;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fs::metadata;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use std::fs::metadata;
-use std::ffi::OsString;
 
 use indoc::printdoc;
 use gumdrop::Options;
 use gumdrop::ParsingStyle;
 // re-export 'duct' because it takes care of simplifying command lines and piping.
 pub use duct; 
+use duct::cmd;
 use duct::Expression;
+use duct::IntoExecutablePath;
 // re-export 'glob' in case the user needs to use it for something more interesting than what I use it for.
 pub use glob;
-// This has to be renamed to avoid conflict with the crate it is found in.
-use glob::glob as glob_glob;
 
 #[derive(Debug)]
 /// An error which could be returned during processing of a task's command. This is wrapped in [WorkshopError::Command].
@@ -74,6 +74,43 @@ impl Display for SkipError {
     }
 }
 
+#[derive(Debug)]
+/// An error returned while globbing a string
+pub enum GlobError {
+    PatternError(glob::PatternError),
+    ParseError(glob::GlobError)
+}
+
+impl Error for GlobError {
+
+}
+
+
+impl Display for GlobError {
+
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GlobError::PatternError(err) => write!(f,"{err}"),
+            GlobError::ParseError(err) => write!(f,"{err}"),
+        }
+    }
+}
+
+impl From<glob::PatternError> for GlobError {
+
+    fn from(value: glob::PatternError) -> Self {
+        Self::PatternError(value)
+    }
+}
+
+impl From<glob::GlobError> for GlobError {
+
+    fn from(value: glob::GlobError) -> Self {
+        Self::ParseError(value)
+    }
+}
+
+
 
 #[derive(Debug)]
 /// An error associated with [Workshop].
@@ -82,10 +119,8 @@ pub enum WorkshopError {
     Skip(String,SkipError),
     /// This is returned if an error occurs while running a task's command.
     Command(String, CommandError),
-    /// This is returned by [Workshop::glob] if an invalid pattern is checked.
-    GlobPattern(glob::PatternError),
-    /// This is returned by [Workshop::glob] if an error occurs while generating paths.
-    Glob(glob::GlobError),
+    /// This is returned by globbing functionality if an error occurs
+    Glob(GlobError),
     /// This is returned by [Workshop::add] if the task already exists.
     TaskAlreadyExists(String),
     /// This is returned during dependency checking if a task is referenced that does not exist.
@@ -107,7 +142,6 @@ impl Display for WorkshopError {
         match self {
             Self::Skip(name,err) => write!(f,"While checking if task '{name}' should be skipped: {err}"),
             Self::Command(name,err) => write!(f,"While running command in task '{name}': {err}"),
-            Self::GlobPattern(err) => write!(f,"{err}"),
             Self::Glob(err) => write!(f,"{err}"),
             Self::TaskAlreadyExists(name) => write!(f,"Task '{name}' already exists."),
             Self::TaskDoesNotExist(name) => write!(f,"Task '{name}' does not exist."),
@@ -122,14 +156,14 @@ impl Display for WorkshopError {
 impl From<glob::PatternError> for WorkshopError {
 
     fn from(value: glob::PatternError) -> Self {
-        Self::GlobPattern(value)
+        Self::Glob(value.into())
     }
 }
 
 impl From<glob::GlobError> for WorkshopError {
 
     fn from(value: glob::GlobError) -> Self {
-        Self::Glob(value)
+        Self::Glob(value.into())
     }
 }
 
@@ -194,6 +228,61 @@ impl Skip {
         Ok(result)
     }
 
+}
+
+/// An enum which can either be a regular string, or a string meant to be a glob pattern. Use [glob_str] to create a pattern, or [Into] to convert a regular `string` or `&str` into a non-pattern string.
+pub enum GlobString {
+    Glob(String),
+    String(String)
+}
+
+impl Into<GlobString> for String {
+    fn into(self) -> GlobString {
+        GlobString::String(self)
+    }
+}
+
+impl Into<GlobString> for &str {
+    fn into(self) -> GlobString {
+        GlobString::String(self.to_owned())
+    }
+}
+
+/// Use this command to create a pattern to be passed to [glob_cmd] or [glob_cmd!]
+pub fn glob_str<Pattern: Into<String>>(pattern: Pattern) -> GlobString {
+    GlobString::Glob(pattern.into())
+}
+
+/// Wraps [duct::cmd] to accept potential glob patterns ([GlobString]) as arguments. If a glob pattern is passed, it is expanded into paths and pushed onto the arguments for the resulting command. The pattern is evaluated at construction time, so if you have a task that needs to check at the time it runs, you would have to use a closure instead.
+pub fn glob_cmd<Executable, Arguments>(program: Executable, glob_args: Arguments) -> Result<Expression,GlobError>
+where
+    Executable: IntoExecutablePath,
+    Arguments: IntoIterator,
+    Arguments::Item: Into<GlobString>,
+{
+    // I thought about turning this into an Iterator, except that the iterator has to return a result, no the OSString,
+    // and since the cmd function doesn't handle errors in the iterator, that won't work.
+    let mut args: Vec<OsString> = Vec::new();
+    for arg in glob_args {
+        match arg.into() {
+            GlobString::Glob(glob) => for path in glob::glob(&glob)? {
+                args.push(path?.into())
+            },
+            GlobString::String(string) => args.push(string.into()),
+        }
+    }
+    Ok(cmd(program,args))
+}
+
+/// A replacement for [duct::cmd!] which accepts glob patterns created with [glob_str].
+#[macro_export]
+macro_rules! glob_cmd {
+    ( $program:expr $(, $arg:expr )* $(,)? ) => {
+        {
+            let args: std::vec::Vec<$crate::GlobString> = std::vec![$( Into::<$crate::GlobString>::into($arg) ),*];
+            $crate::glob_cmd($program, args)
+        }
+    };
 }
 
 // The enum is much easier to work with than trying to manipulate traits.
@@ -360,34 +449,6 @@ impl Workshop {
     /// Returns a default Workshop, with no tasks.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    // NOTE: The globbing works when it's called, so the files would have to exist when the 
-    // tasks are built, unless you use a function task and call it in there. I'm not sure of a way to make this easier without
-    // recreating the 'cmd' function and macros to take enums that allow for glob patterns, and expand
-    // them on run. However, I also am not sure I see the need for glob patterns in this type of tool:
-    // it's better to have a known list of files to run a task on, rather than hope that the user doesn't
-    // add an extra file which would then have to be processed.
-    /// This associated function can be used to turn a number of glob patterns (ex: `*.txt`) into a list of something that can be turned into a path. For more information, and access to more related functionality, see [glob].
-    pub fn glob<Something: From<PathBuf>,Pattern: AsRef<str>>(patterns: &[Pattern]) -> Result<Vec<Something>,WorkshopError> {
-        let mut result = Vec::new();
-        for pattern in patterns {
-            for path in glob_glob(pattern.as_ref())? {
-                result.push((path?).into())
-            }
-        }
-        Ok(result)
-
-    }
-
-    /// This associated function can be used to turn a number of glob patterns (ex: `*.txt`) into a list of paths. For more information, and access to more related functionality, see [glob].
-    pub fn glob_to_paths<Pattern: AsRef<str>>(patterns: &[Pattern]) -> Result<Vec<PathBuf>,WorkshopError> {
-        Self::glob(patterns)
-    }
-
-    /// This associated function can be used to turn a number of glob patterns (ex: `*.txt`) into a list of strings. For more information, and access to more related functionality, see [glob].
-    pub fn glob_to_osstrings<Pattern: AsRef<str>>(patterns: &[Pattern]) -> Result<Vec<OsString>,WorkshopError> {
-        Self::glob(patterns)
     }
 
     /// Call this function to add a new task by name.

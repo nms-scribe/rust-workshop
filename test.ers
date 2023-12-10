@@ -11,6 +11,8 @@
 use rust_workshop::Workshop;
 use rust_workshop::duct::cmd;
 use rust_workshop::task;
+use rust_workshop::glob_cmd;
+use rust_workshop::glob_str;
 use std::error::Error;
 
 
@@ -85,14 +87,13 @@ fn main() -> Result<(),Box<dyn Error>> {
     workshop.add("test-glob", task!{
         help: "Test if glob star expressions work.",
         function: || {
-            let cargo_files = Workshop::glob_to_osstrings(&["Cargo.*"])?;
-            let cmd = cmd("ls",cargo_files);
+            let cmd = glob_cmd!("ls",glob_str("Cargo.*"))?;
             let output = cmd.read()?;
             let output = output.split('\n').collect::<Vec<_>>();
             if output.len() == 2 && output.contains(&"Cargo.toml") && output.contains(&"Cargo.lock") {
                 Ok(())
             } else {
-                Err(format!("test-glob returned invalid data from 'ls': {}",output.join("\n")).into())
+                Err(format!("test-glob returned unexpected data from 'ls': {}",output.join("\n")).into())
             }
         },
     })?;
