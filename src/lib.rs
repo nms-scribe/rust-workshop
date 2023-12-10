@@ -197,11 +197,11 @@ impl Skip {
 
     /// Checks the files in `source` against the files in `target`. If all of the files in `source` are older than the newest file in `target`, true is returned. Otherwise, false is returned, unless an IO error occurs while checking the data.
     pub fn must_skip_if_older_than(source: &[PathBuf], target: &[PathBuf], trace: bool) -> Result<bool, std::io::Error> {
-        let source_time = Self::get_max_modified_time_for(source)?;
+        let source_time = Self::get_max_modified_time_for(source,false)?;
         if trace {
             println!("source time: {source_time:?}");
         }
-        let target_time = Self::get_max_modified_time_for(target)?;
+        let target_time = Self::get_max_modified_time_for(target,true)?;
         if trace {
             println!("target time: {target_time:?}");
         }
@@ -218,11 +218,17 @@ impl Skip {
 
     }
 
-    /// Finds the timestamp of the newest file in the specified list, and returns that timestamp. Returns none if the list is empty or if the timestamp can not be found. If an io error occurs during checking, that is returned.
-    pub fn get_max_modified_time_for(source: &[PathBuf]) -> Result<Option<SystemTime>, std::io::Error> {
+    /// Finds the timestamp of the newest file in the specified list, and returns that timestamp. Returns none if the list is empty or if the timestamp can not be found. If an io error occurs during checking, that is returned. Pass `false` to `ignore_missing` if you want it to ignore missing files, which probably should be done for target files.
+    pub fn get_max_modified_time_for(source: &[PathBuf], ignore_missing: bool) -> Result<Option<SystemTime>, std::io::Error> {
         let mut result = None;
         for source in source {
-            let source_time = metadata(source)?.modified()?;
+            let metadata = metadata(source);
+            let metadata = if ignore_missing && metadata.is_err() {
+                continue;
+            } else {
+                metadata?
+            };
+            let source_time = metadata.modified()?;
             result = result.max(Some(source_time));
         }
         Ok(result)
@@ -781,7 +787,13 @@ mod tests {
             function: move || {output.borrow_mut().push("10"); Ok(( ))},
         }).expect("Task should have been added.");
 
-        workshop.run_tasks(&["5","8"],false,false).expect("Tasks should have run.");
+        workshop.add("test-skip-missing", task!{
+            help: "Test skipping a missing file",
+            skip_if_older_than: (&["src/lib.rs"],&["src/lib.txt"]),
+            // If this one causes an error, then the test failed.
+        }).expect("Task should have been added.");
+
+        workshop.run_tasks(&["5","8","test-skip-missing"],false,false).expect("Tasks should have run.");
 
         assert_eq!(result.take(),vec!["2","9","10","11","5","8"]);
 
