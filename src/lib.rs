@@ -6,12 +6,14 @@ rust-workshop is a task processing crate, for when makefile, justfile, or whatev
 use core::fmt::Display;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::metadata;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::cell::BorrowMutError;
 
 use indoc::printdoc;
 use gumdrop::Options;
@@ -24,6 +26,33 @@ use duct::IntoExecutablePath;
 // re-export 'glob' in case the user needs to use it for something more interesting than what I use it for.
 pub use glob;
 
+// TODO: I also need a "CompoundDependency" which lets me depend on one argument task multiple times with different arguments.
+// TODO: I can use the following for templates...
+macro_rules! test_template {
+    ($($variable: ident),* { $($statement: expr);*  }) => {
+        fn test_this(map: std::collections::HashMap<String,String>) -> usize {
+            $(
+                let $variable = map.get(stringify!($variable)).expect(concat!("Variable ",stringify!($variable)," was not available."));
+            )*
+            $($statement);*
+
+        }
+        
+    };
+}
+
+test_template!(bar,foo,gee {
+    println!("{bar}");
+    println!("{foo}");
+    println!("{gee}");
+    if gee == "no" {
+        println!("no")
+    } else {
+        println!("2")
+    };
+    23
+});
+
 #[derive(Debug)]
 /// An error which could be returned during processing of a task's command. This is wrapped in [WorkshopError::Command].
 pub enum CommandError {
@@ -31,6 +60,8 @@ pub enum CommandError {
     Process(std::io::Error),
     /// An error returned from a command function
     Function(Box<dyn Error>),
+    /// An error caused by an inability to borrow a function
+    FunctionBorrow(BorrowMutError)
 }
 
 impl Error for CommandError {
@@ -44,7 +75,14 @@ impl Display for CommandError {
         match self {
             Self::Process(err) => write!(f,"{err}"),
             Self::Function(err) => write!(f,"from function: {err}"),
+            Self::FunctionBorrow(_) => write!(f,"A function pointer was already borrowed.") // This might happen if someone attempts a recursive task.
         }
+    }
+}
+
+impl From<BorrowMutError> for CommandError {
+    fn from(value: BorrowMutError) -> Self {
+        Self::FunctionBorrow(value)
     }
 }
 
@@ -131,6 +169,10 @@ pub enum WorkshopError {
     CyclicalDependency(String),
     /// This is returned during dependency checking if a task is found, but is marked internal and can't be referenced from the command-line.
     TaskIsNotAvailable(String),
+    /// This is returned if an attempt was made to use a task that was already mutably borrowed. It might happen if you attempt to run a task recursively.
+    TaskBorrow(String),
+    /// This is returned if an attempt was made to call a task that was already borrowed. It might happen if you attempt to run a task recursively.
+    TaskBorrowMut(String),
 }
 
 impl Error for WorkshopError {
@@ -148,6 +190,8 @@ impl Display for WorkshopError {
             Self::Arguments(err) => write!(f,"{err}"),
             Self::CyclicalDependency(name) => write!(f,"Task '{name}' depends on itself."),
             Self::TaskIsNotAvailable(name) => write!(f,"Task '{name}' is not available."),
+            Self::TaskBorrow(name) => write!(f,"Task '{name}' was referenced while being called."),
+            Self::TaskBorrowMut(name) => write!(f,"Task '{name}' was called while still referenced elsewhere.")
         }
     }
 }
@@ -175,9 +219,10 @@ impl From<gumdrop::Error> for WorkshopError {
 }
 
 /// A Skip object represents a method used for checking if a task should be skipped.
+#[derive(Clone)]
 pub enum Skip {
     /// In this method, a function is called which returns a bool or an error. If `Ok(true)` is returned, the task will be skipped. If an error is returned, the whole process will fail.
-    Function(Box<dyn Fn() -> Result<bool,Box<dyn Error>>>),
+    Function(Rc<dyn Fn() -> Result<bool,Box<dyn Error>>>),
     /// In this method, the modified times of the files in `source` are compared to those of `target`. If all of the files in `source` are older than the newest file in `target`, the task shall be skipped.
     IfOlderThan{
         source: Vec<PathBuf>,
@@ -293,9 +338,10 @@ macro_rules! glob_cmd {
 
 // The enum is much easier to work with than trying to manipulate traits.
 /// Represents a method for running a command for a task.
+#[derive(Clone)]
 pub enum Command {
     /// The command is encapsulated in a function that takes no parameters, and returns a result.
-    Function(Box<dyn FnMut() -> Result<(),Box<dyn Error>>>),
+    Function(Rc<RefCell<dyn FnMut() -> Result<(),Box<dyn Error>>>>),
     // You know, I could technically turn this into a function as well... I just feel like the
     // abstraction isn't necessary and the additional 'dyn' boundary might complicate things. Plus more useful error...
     /// The command is a subprocess command, represented by [duct::Expression]. Use [duct::cmd()] or [duct::cmd!()] to build this expression, and functions on `Expression` to add things like piping and redirecting.
@@ -320,7 +366,7 @@ impl Command {
     /// Runs the appropriate command. If `Err` is returned, the entire process will fail.
     pub fn run(&mut self) -> Result<(),CommandError> {
         match self {
-            Self::Function(function) => (function)().map_err(CommandError::Function),
+            Self::Function(function) => (function.try_borrow_mut()?)().map_err(CommandError::Function),
             Self::Command(expression) => Self::run_process(expression).map_err(CommandError::Process)
         }
     }
@@ -353,6 +399,7 @@ pub struct ProgramOptions {
 }
 
 /// This represents a task that workshop is expected to run. Use [Task::new] or [task!] to create a task, and add it with [Workshop::add].
+#[derive(Clone)]
 pub struct Task {
     help: String,
     dependencies: Vec<String>,
@@ -392,8 +439,8 @@ impl Task {
     }
 
     /// Adds a function command to the task. See [Command::Function]. Multiple commands can be added, they are executed in order of insertion.
-    pub fn function<Function: FnMut() -> Result<(),Box<dyn Error>> + 'static>(&mut self, function: Function) {
-        self.add_command(Command::Function(Box::from(function)))
+    pub fn function<Function: FnMut() -> Result<(),Box<dyn Error>>+ 'static>(&mut self, function: Function) {
+        self.add_command(Command::Function(Rc::from(RefCell::from(function))))
     }
 
     /// Adds a process command to the task. See [Command::Command]. Multiple commands can be added, they are executed in order of insertion.
@@ -409,8 +456,8 @@ impl Task {
     }
 
     /// Tells the task that it should skip based on the result of the specified function. See [Skip::Function].
-    pub fn skip<Function: Fn() -> Result<bool,Box<dyn Error>> + 'static>(&mut self, function: Function) {
-        self.skip = Some(Skip::Function(Box::from(function)));
+    pub fn skip<Function: Fn() -> Result<bool,Box<dyn Error>>+ 'static>(&mut self, function: Function) {
+        self.skip = Some(Skip::Function(Rc::from(function)));
     }
 
     /// Marks the task as internal. Internal tasks can not be called from the command line, nor are they listed. However, they may be used as dependencies of non-internal tasks.
@@ -418,6 +465,29 @@ impl Task {
         self.internal = true;
     }
 
+}
+
+pub enum TaskEntry {
+    Task(Task)
+}
+impl TaskEntry {
+    fn internal(&self) -> bool {
+        match self {
+            TaskEntry::Task(task) => task.internal,
+        }
+    }
+
+    fn help(&self) -> &String {
+        match self {
+            TaskEntry::Task(task) => &task.help,
+        }
+    }
+
+    fn prepare(&self) -> Result<Rc<RefCell<Task>>, WorkshopError> {
+        match self {
+            TaskEntry::Task(task) => Ok(Rc::from(RefCell::from(task.clone()))),
+        }
+    }
 }
 
 #[macro_export]
@@ -434,7 +504,7 @@ macro_rules! task {
         $(
             task!(@key task, $key $(: $value)?);
         )*
-        task
+        $crate::TaskEntry::Task(task)
     }};
 }
 
@@ -447,7 +517,7 @@ A Workshop object represents a set of tasks to run, and contains functionality f
 The easiest way to work with a workshop is by creating a rust-script, or a full-fledged binary project if you want to. In the main function of your script, create the workshop with [Workshop::new], add tasks to it with [Workshop::add] and the [task!] macro, and then call [Workshop::main], which will collect the arguments from the command line.
 */
 pub struct Workshop {
-    tasks: HashMap<String,Task>
+    tasks: HashMap<String,TaskEntry>
 }
 
 impl Workshop {
@@ -458,7 +528,7 @@ impl Workshop {
     }
 
     /// Call this function to add a new task by name.
-    pub fn add<Name: Into<String> + Display>(&mut self, name: Name, task: Task) -> Result<(),WorkshopError> {
+    pub fn add<Name: Into<String> + Display>(&mut self, name: Name, task: TaskEntry) -> Result<(),WorkshopError> {
         let name = name.into();
         if self.tasks.insert(name.clone(), task).is_some() {
             Err(WorkshopError::TaskAlreadyExists(name))
@@ -469,35 +539,31 @@ impl Workshop {
     }
 
     /// Call this function to run tasks directly. Specify the tasks to run under `tasks`. If `trace_dependencies` is true, messages will be printed to stdout during dependency calculation. If `trace_commands` is true, messages will be printed to stdout during command processing.
-    pub fn run_tasks<Task: AsRef<str>>(&mut self, tasks: &[Task], trace_dependencies: bool, trace_commands: bool) -> Result<(),WorkshopError> {
+    pub fn run_tasks<TaskName: AsRef<str>>(&mut self, tasks: &[TaskName], trace_dependencies: bool, trace_commands: bool) -> Result<(),WorkshopError> {
 
-        let task_list = self.calculate_dependency_list(tasks, trace_dependencies)?;
+        let mut task_list = self.calculate_dependency_list(tasks, trace_dependencies)?;
 
-        for name in task_list {
-            if let Some(task) = self.tasks.get_mut(&name) {
+        for (name,task) in &mut task_list {
 
-                let skip = if let Some(skip) = &task.skip {
-                    if trace_commands {
-                        println!("Checking if task '{name}' should be skipped.");
-                    }
-                    skip.must_skip(trace_commands).map_err(|err| WorkshopError::Skip(name.clone(),err))?  
-                } else {
-                    false
-                };
-
-                if !skip {
-                    if trace_commands {
-                        println!("Running task '{name}'.");
-                    }
-
-                    for command in &mut task.command {
-                        command.run().map_err(|err| WorkshopError::Command(name.clone(), err))?
-                    }
-                } else if trace_commands {
-                    println!("Skipping task '{name}'.");
+            let skip = if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.skip {
+                if trace_commands {
+                    println!("Checking if task '{name}' should be skipped.");
                 }
+                skip.must_skip(trace_commands).map_err(|err| WorkshopError::Skip(name.clone(),err))?  
             } else {
-                return Err(WorkshopError::TaskDoesNotExist(name));
+                false
+            };
+
+            if !skip {
+                if trace_commands {
+                    println!("Running task '{name}'.");
+                }
+
+                for command in &mut task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrowMut(name.to_owned()))?.command {
+                    command.run().map_err(|err| WorkshopError::Command(name.clone(), err))?
+                }
+            } else if trace_commands {
+                println!("Skipping task '{name}'.");
             }
 
         }
@@ -578,8 +644,8 @@ impl Workshop {
         } else {
             for key in tasks {
                 if let Some(value) = self.tasks.get(key.as_ref()) {
-                    if !value.internal {
-                        let help = &value.help;
+                    if !value.internal() {
+                        let help = &value.help();
                         println!("{key}\t{help}")
                     } else {
                         println!("'{key}' is not an available task.")
@@ -598,8 +664,8 @@ impl Workshop {
             println!("  -- none --")
         } else {
             for (key,value) in &self.tasks {
-                if !value.internal {
-                    let help = &value.help;
+                if !value.internal() {
+                    let help = &value.help();
                     println!("{key}:\n {help}")
                 }
             }
@@ -615,7 +681,7 @@ impl Workshop {
 
     // No reason not to make this public. If the user wants to do some testing.
     /// This is called automatically by [Workshop::main] and [Workshop::run] to calculate dependencies for tasks from the command line. It returns a list of tasks which must be run to accomplish the passed tasks. The `trace` parameter specifies whether trace messages will be logged to stdout during this checking.
-    pub fn calculate_dependency_list<Task: AsRef<str>>(&self, tasks: &[Task], trace: bool) -> Result<Vec<String>,WorkshopError> {
+    pub fn calculate_dependency_list<TaskName: AsRef<str>>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(String,Rc<RefCell<Task>>)>,WorkshopError> {
         let mut checker = DependencyChecker::new(self, trace);
 
         for task in tasks {
@@ -631,9 +697,9 @@ impl Workshop {
 /// This is used by the workshop to calculate dependencies. It is intended for advanced usage only.
 pub struct DependencyChecker<'workshop> {
     workshop: &'workshop Workshop,
-    marked: HashSet<String>,
-    cyclical_check: HashSet<String>,
-    tasks: Vec<String>,
+    marked: HashMap<String,Rc<RefCell<Task>>>,
+    cyclical_check: HashMap<String,Rc<RefCell<Task>>>,
+    tasks: Vec<(String,Rc<RefCell<Task>>)>,
     trace: bool
 }
 
@@ -643,8 +709,8 @@ impl DependencyChecker<'_> {
     pub fn new(workshop: &Workshop, trace: bool) -> DependencyChecker {
         DependencyChecker {
             workshop,
-            marked: HashSet::new(),
-            cyclical_check: HashSet::new(),
+            marked: HashMap::new(),
+            cyclical_check: HashMap::new(),
             tasks: Vec::new(),
             trace
         }
@@ -658,38 +724,40 @@ impl DependencyChecker<'_> {
 
     fn visit_dependencies(&mut self, node: &str, first_level: bool, indent: &str) -> Result<(),WorkshopError> {
         self.trace(indent,format!("Visiting dependent task {node}"));
-        if self.marked.contains(node) {
+        if self.marked.contains_key(node) {
             self.trace(indent,format!("Task {node} already checked."));
             Ok(()) 
-        } else if self.cyclical_check.contains(node) {
+        } else if self.cyclical_check.contains_key(node) {
             Err(WorkshopError::CyclicalDependency(node.to_owned()))
-        } else if let Some(task_info) = self.workshop.tasks.get(node) {
+        } else if let Some(task_entry) = self.workshop.tasks.get(node) {
 
-            if first_level && task_info.internal {
+            if first_level && task_entry.internal() {
 
                 // this was a task "picked" by the user, but it is marked as internal and therefore not supposed to be called directly.
                 Err(WorkshopError::TaskIsNotAvailable(node.to_owned()))
 
             } else {
 
-                self.trace(indent,format!("Marking task {node} for cyclical check."));
-                self.cyclical_check.insert(node.to_owned());
+                let task = task_entry.prepare()?;
 
-                for task in &task_info.dependencies {
+                self.trace(indent,format!("Marking task {node} for cyclical check."));
+                self.cyclical_check.insert(node.to_owned(),task.clone());
+
+                for task in &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(node.to_owned()))?.dependencies {
                     self.visit_dependencies(task,false,&format!("  {indent}"))?;
                 }
     
                 self.trace(indent,format!("Unmarking task {node} for cyclical check."));
-                // to avoid allocation, take the node that we just cloned before.
-                let node = self.cyclical_check.take(node).expect("This was just inserted, it should still be here.");
+                // it's no longer being checked, so remove it.
+                self.cyclical_check.remove(node).expect("This was just inserted, it should still be here.");
     
                 self.trace(indent,format!("Marking task {node} as checked."));
                 // If I had some sort of map that maintained an order of insert, I wouldn't need a separate marked set and list of tasks. But I feel like adding that sort of crate in would be overkill.
-                self.marked.insert(node.clone());
+                self.marked.insert(node.to_owned(),task.clone());
     
                 self.trace(indent,format!("Adding task {node} to list."));
                 // all of its dependencies are already on the list, so this can go on now.
-                self.tasks.push(node);
+                self.tasks.push((node.to_owned(),task));
     
                 Ok(()) 
 
@@ -712,7 +780,7 @@ impl DependencyChecker<'_> {
     }
 
     /// Drops the checker and returns the generated list of tasks, as built during calls to [require_task].
-    fn into_tasks(self) -> Vec<String> {
+    fn into_tasks(self) -> Vec<(String,Rc<RefCell<Task>>)> {
         self.tasks
     }
 
@@ -796,6 +864,6 @@ mod tests {
         workshop.run_tasks(&["5","8","test-skip-missing"],false,false).expect("Tasks should have run.");
 
         assert_eq!(result.take(),vec!["2","9","10","11","5","8"]);
-
+        
     }
 }
