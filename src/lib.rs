@@ -470,7 +470,7 @@ macro_rules! dep {
     ($name: expr, $($key: expr => $value: expr),+  $(,)?) => {{
         let mut args = std::collections::BTreeMap::new();
         $(
-            dep!(@arg args, $key, $value);
+            $crate::dep!(@arg args, $key, $value);
         )+
         $crate::TaskDependency::Arguments($name.into(),args)
     }};
