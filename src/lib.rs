@@ -14,44 +14,18 @@ use std::time::SystemTime;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::cell::BorrowMutError;
+use std::collections::BTreeMap;
 
 use indoc::printdoc;
 use gumdrop::Options;
 use gumdrop::ParsingStyle;
-// re-export 'duct' because it takes care of simplifying command lines and piping.
+/// re-export 'duct' because it takes care of simplifying command lines and piping.
 pub use duct; 
 use duct::cmd;
 use duct::Expression;
 use duct::IntoExecutablePath;
-// re-export 'glob' in case the user needs to use it for something more interesting than what I use it for.
+/// re-export 'glob' in case the user needs to use it for something more interesting than what I use it for.
 pub use glob;
-
-// TODO: I also need a "CompoundDependency" which lets me depend on one argument task multiple times with different arguments.
-// TODO: I can use the following for templates...
-macro_rules! test_template {
-    ($($variable: ident),* { $($statement: expr);*  }) => {
-        fn test_this(map: std::collections::HashMap<String,String>) -> usize {
-            $(
-                let $variable = map.get(stringify!($variable)).expect(concat!("Variable ",stringify!($variable)," was not available."));
-            )*
-            $($statement);*
-
-        }
-        
-    };
-}
-
-test_template!(bar,foo,gee {
-    println!("{bar}");
-    println!("{foo}");
-    println!("{gee}");
-    if gee == "no" {
-        println!("no")
-    } else {
-        println!("2")
-    };
-    23
-});
 
 #[derive(Debug)]
 /// An error which could be returned during processing of a task's command. This is wrapped in [WorkshopError::Command].
@@ -148,6 +122,33 @@ impl From<glob::GlobError> for GlobError {
     }
 }
 
+#[derive(Debug)]
+/// An error returned while preparing a task
+pub enum PrepareError {
+    TemplateError(Box<dyn Error>),
+    TaskRequiresArguments,
+}
+
+impl Error for PrepareError {
+
+}
+
+impl Display for PrepareError {
+
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TemplateError(err) => write!(f,"{err}"),
+            Self::TaskRequiresArguments => write!(f,"task requires arguments.")
+        }
+    }
+
+}
+
+impl From<Box<dyn Error>> for PrepareError {
+    fn from(value: Box<dyn Error>) -> Self {
+        Self::TemplateError(value)
+    }
+}
 
 
 #[derive(Debug)]
@@ -173,6 +174,8 @@ pub enum WorkshopError {
     TaskBorrow(String),
     /// This is returned if an attempt was made to call a task that was already borrowed. It might happen if you attempt to run a task recursively.
     TaskBorrowMut(String),
+    /// This is returned if an attempt to prepare a task failed
+    Prepare(String, PrepareError),
 }
 
 impl Error for WorkshopError {
@@ -191,7 +194,8 @@ impl Display for WorkshopError {
             Self::CyclicalDependency(name) => write!(f,"Task '{name}' depends on itself."),
             Self::TaskIsNotAvailable(name) => write!(f,"Task '{name}' is not available."),
             Self::TaskBorrow(name) => write!(f,"Task '{name}' was referenced while being called."),
-            Self::TaskBorrowMut(name) => write!(f,"Task '{name}' was called while still referenced elsewhere.")
+            Self::TaskBorrowMut(name) => write!(f,"Task '{name}' was called while still referenced elsewhere."),
+            Self::Prepare(name, err) => write!(f,"While preparing task '{name}': {err}"),
         }
     }
 }
@@ -287,15 +291,15 @@ pub enum GlobString {
     String(String)
 }
 
-impl Into<GlobString> for String {
-    fn into(self) -> GlobString {
-        GlobString::String(self)
+impl From<String> for GlobString {
+    fn from(val: String) -> Self {
+        GlobString::String(val)
     }
 }
 
-impl Into<GlobString> for &str {
-    fn into(self) -> GlobString {
-        GlobString::String(self.to_owned())
+impl From<&str> for GlobString {
+    fn from(val: &str) -> Self {
+        GlobString::String(val.to_owned())
     }
 }
 
@@ -336,7 +340,6 @@ macro_rules! glob_cmd {
     };
 }
 
-// The enum is much easier to work with than trying to manipulate traits.
 /// Represents a method for running a command for a task.
 #[derive(Clone)]
 pub enum Command {
@@ -374,7 +377,7 @@ impl Command {
 
 
 #[allow(non_snake_case)] // gumdrop does not allow me to change the name of the positional argument "TASKS" field in help, so this is the only way to capitalize it. The allow tag will not work directly on the field, probably because of the derive trait.
-#[derive(Options)]
+#[derive(Options,Default)]
 /// Command line arguments in [Workshop::run] and [Workshop::main] are parsed into this object, with the help of [gumdrop::Options].
 pub struct ProgramOptions {
     #[options(help = "Print help")]
@@ -392,17 +395,108 @@ pub struct ProgramOptions {
     #[options(short = "T", help = "Output trace messages for dependency calculation.")]
     trace_dependencies: bool,
 
+    #[options(short = "f", help = "Force all tasks to run, ignoring skip rules.")]
+    force: bool,
 
     #[options(free,help = "Tasks to run")]
     TASKS: Vec<String>
 
 }
 
+#[derive(Clone,PartialEq,Eq,Hash)]
+/// Represents a task which another task is dependent on. This can be a simple task name, or it can be a name plus arguments.
+pub enum TaskDependency {
+    Simple(String),
+    // use BTreeMap because it implements Hash
+    Arguments(String,BTreeMap<String,String>)
+}
+
+impl TaskDependency {
+
+    fn name(&self) -> &String {
+        match self {
+            TaskDependency::Simple(name) => name,
+            TaskDependency::Arguments(name, _) => name,
+        }
+    }
+
+    fn arguments(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            TaskDependency::Simple(_) => None,
+            TaskDependency::Arguments(_, args) => Some(args),
+        }
+    }
+
+}
+
+impl From<String> for TaskDependency {
+    fn from(value: String) -> Self {
+        Self::Simple(value)
+    }
+}
+
+impl From<&str> for TaskDependency {
+    fn from(value: &str) -> Self {
+        Self::Simple(value.to_owned())
+    }
+}
+
+fn trace_args(args: Option<&BTreeMap<String,String>>) -> String {
+    let mut result = String::new();
+    if let Some(args) = args {
+        for (key,value) in args {
+            result.push_str(&format!("{key} => '{value}' "));
+        }
+    } else {
+        result.push_str("None")
+    }
+    result
+
+}
+
+#[macro_export]
+/// This macro can be used to make [TaskDependency]'s. Note that plain dependencies can often get by with String-like values, due to implementations of `From` for `TaskDependency`. However, if a dependency requires arguments, this macro will be more useful. To create such a dependency, pass the name, followed by comma separated pairs like `"key" => "value"`. To call a parameter task with zero parameters, simply add a comma after the task name.
+macro_rules! dep {
+    ($name: expr) => {
+        $crate::TaskDependency::Simple($name)
+    };
+    (@arg $args: expr, $key: expr, $value: expr) => {
+        $args.insert($key.into(),$value.into())
+    };
+    ($name: expr,) => {{
+        let args = std::collections::BTreeMap::new();
+        $crate::TaskDependency::Arguments($name.into(),args)
+    }};
+    ($name: expr, $($key: expr => $value: expr),+  $(,)?) => {{
+        let mut args = std::collections::BTreeMap::new();
+        $(
+            dep!(@arg args, $key, $value);
+        )+
+        $crate::TaskDependency::Arguments($name.into(),args)
+    }};
+}
+
+/**
+Sometimes, you may want to depend on the same task run against multiple files (or other entities). For example, you have a single task to process an image, and you have about a dozen images to process in the same way. The `multi_dep` macro lets you specify that task with an array of values for one parameter, and expands to an array of [TaskDependency]'s, one for each of those values. You may also specify values for additional parameters, but only one can be an array.
+
+Note that this returns a vector, and should be called outside brackets in assigning the dependencies to a task.
+*/
+#[macro_export]
+macro_rules! multi_dep {
+    ($name: expr, $array_key: expr => $array_expr: expr $(, $key: expr => $value: expr)*  $(,)?) => {{
+        let mut dependencies = Vec::new();
+        for value in $array_expr {
+            dependencies.push(dep!($name,$array_key=>value $(, $key => $value)*))
+        }
+        dependencies
+    }};
+}
+
 /// This represents a task that workshop is expected to run. Use [Task::new] or [task!] to create a task, and add it with [Workshop::add].
 #[derive(Clone)]
 pub struct Task {
     help: String,
-    dependencies: Vec<String>,
+    dependencies: Vec<TaskDependency>,
     command: Vec<Command>,
     skip: Option<Skip>,
     internal: bool
@@ -423,12 +517,12 @@ impl Task {
     }
 
     /// Adds the name of another task as a dependency to the current task.
-    pub fn dependency<Dependency: Into<String>>(&mut self, dependency: Dependency) {
+    pub fn dependency<Dependency: Into<TaskDependency>>(&mut self, dependency: Dependency) {
         self.dependencies.push(dependency.into());
     }
 
     /// Adds several dependencies into the current task.
-    pub fn dependencies<Dependency: Into<String> + Clone>(&mut self, dependencies: &[Dependency]) {
+    pub fn dependencies<Dependency: Into<TaskDependency> + Clone>(&mut self, dependencies: &[Dependency]) {
         for dependency in dependencies {
             self.dependencies.push(dependency.clone().into());
         }
@@ -467,26 +561,53 @@ impl Task {
 
 }
 
-pub enum TaskEntry {
-    Task(Task)
+/// A Parameter Task describes a function which can return a task given a set of named arguments. The easiest way to create one is to use [param_task!]
+pub struct ParameterTask {
+    template: Box<dyn Fn(&BTreeMap<String,String>) -> Result<Task,Box<dyn Error>>>
 }
+
+impl ParameterTask {
+
+    /// Call this to create a ParameterTask if you want more control over the result than [param_task!] provides.
+    pub fn new<Template: Fn(&BTreeMap<String,String>) -> Result<Task,Box<dyn Error>> + 'static>(template: Template) -> Self {
+        Self {
+            template: Box::from(template)
+        }
+
+    }
+}
+
+/// There are two types of tasks which can be added to a workshop, a [Task] and a [ParameterTask].
+pub enum TaskEntry {
+    Task(Task),
+    ParameterTask(ParameterTask)
+}
+
 impl TaskEntry {
     fn internal(&self) -> bool {
         match self {
             TaskEntry::Task(task) => task.internal,
+            TaskEntry::ParameterTask(_) => true,
         }
     }
 
-    fn help(&self) -> &String {
+    fn help(&self) -> &str {
         match self {
             TaskEntry::Task(task) => &task.help,
+            TaskEntry::ParameterTask(_) => "",
         }
     }
 
-    fn prepare(&self) -> Result<Rc<RefCell<Task>>, WorkshopError> {
-        match self {
-            TaskEntry::Task(task) => Ok(Rc::from(RefCell::from(task.clone()))),
-        }
+    fn prepare(&self, arguments: Option<&BTreeMap<String,String>>) -> Result<Rc<RefCell<Task>>, PrepareError> {
+        let task = match self {
+            TaskEntry::Task(task) => task.clone(),
+            TaskEntry::ParameterTask(task) => match arguments {
+                Some(arguments) => (task.template)(arguments)?,
+                None => return Err(PrepareError::TaskRequiresArguments),
+            }
+        };
+
+        Ok(Rc::from(RefCell::from(task)))
     }
 }
 
@@ -499,16 +620,35 @@ macro_rules! task {
     (@key $task: ident, $key: ident $(: $value: expr)?) => {
         $task.$key($($value)?)
     };
-    (help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
+    (@task help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
         let mut task = $crate::Task::new($help);
         $(
             task!(@key task, $key $(: $value)?);
         )*
+        task
+    }};
+    (help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
+        let task = task!(@task help: $help, $($key $(: $value)?),*);
         $crate::TaskEntry::Task(task)
     }};
 }
 
+#[macro_export]
+/// This macro allows creation of a task with parameters. It is very similar to the [task!] macro, except that it includes a required field call parameters. The parameters specified in the name can be used in `format!` calls in the expressions specified for the other fields.
+macro_rules! param_task {
+    (params: ($($param: ident),*), help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
+        let task = $crate::ParameterTask::new(|_map| {
+            $(
+                let $param = _map.get(stringify!($param)).ok_or_else(|| -> Box<dyn Error> {
+                     Box::from(concat!("Value not passed for parameter '",stringify!($param),"'."))
+                })?;
+            )*
+            Ok(task!(@task help: $help, $($key $(: $value)?),*))
 
+        });
+        $crate::TaskEntry::ParameterTask(task)
+    }};
+}
 
 #[derive(Default)]
 /**
@@ -539,30 +679,32 @@ impl Workshop {
     }
 
     /// Call this function to run tasks directly. Specify the tasks to run under `tasks`. If `trace_dependencies` is true, messages will be printed to stdout during dependency calculation. If `trace_commands` is true, messages will be printed to stdout during command processing.
-    pub fn run_tasks<TaskName: AsRef<str>>(&mut self, tasks: &[TaskName], trace_dependencies: bool, trace_commands: bool) -> Result<(),WorkshopError> {
+    pub fn run_tasks(&mut self, options: &ProgramOptions) -> Result<(),WorkshopError> {
 
-        let mut task_list = self.calculate_dependency_list(tasks, trace_dependencies)?;
+        let mut task_list = self.calculate_dependency_list(&options.TASKS, options.trace_dependencies)?;
 
         for (name,task) in &mut task_list {
 
-            let skip = if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.skip {
-                if trace_commands {
+            let skip = if options.force {
+                false
+            } else if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.skip {
+                if options.trace {
                     println!("Checking if task '{name}' should be skipped.");
                 }
-                skip.must_skip(trace_commands).map_err(|err| WorkshopError::Skip(name.clone(),err))?  
+                skip.must_skip(options.trace).map_err(|err| WorkshopError::Skip(name.clone(),err))?  
             } else {
                 false
             };
 
             if !skip {
-                if trace_commands {
+                if options.trace {
                     println!("Running task '{name}'.");
                 }
 
                 for command in &mut task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrowMut(name.to_owned()))?.command {
                     command.run().map_err(|err| WorkshopError::Command(name.clone(), err))?
                 }
-            } else if trace_commands {
+            } else if options.trace {
                 println!("Skipping task '{name}'.");
             }
 
@@ -594,7 +736,7 @@ impl Workshop {
         }
         
         if !options.help && !options.version && !options.list {
-            self.run_tasks(&options.TASKS,options.trace_dependencies,options.trace)
+            self.run_tasks(&options)
         } else {
             Ok(())
         }
@@ -681,11 +823,11 @@ impl Workshop {
 
     // No reason not to make this public. If the user wants to do some testing.
     /// This is called automatically by [Workshop::main] and [Workshop::run] to calculate dependencies for tasks from the command line. It returns a list of tasks which must be run to accomplish the passed tasks. The `trace` parameter specifies whether trace messages will be logged to stdout during this checking.
-    pub fn calculate_dependency_list<TaskName: AsRef<str>>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(String,Rc<RefCell<Task>>)>,WorkshopError> {
+    pub fn calculate_dependency_list<TaskName: Into<String> + Clone>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(String,Rc<RefCell<Task>>)>,WorkshopError> {
         let mut checker = DependencyChecker::new(self, trace);
 
         for task in tasks {
-            checker.require_task(task.as_ref())?;
+            checker.require_task(task.clone().into())?;
         }
 
         Ok(checker.into_tasks())
@@ -697,8 +839,8 @@ impl Workshop {
 /// This is used by the workshop to calculate dependencies. It is intended for advanced usage only.
 pub struct DependencyChecker<'workshop> {
     workshop: &'workshop Workshop,
-    marked: HashMap<String,Rc<RefCell<Task>>>,
-    cyclical_check: HashMap<String,Rc<RefCell<Task>>>,
+    marked: HashMap<TaskDependency,Rc<RefCell<Task>>>,
+    cyclical_check: HashMap<TaskDependency,Rc<RefCell<Task>>>,
     tasks: Vec<(String,Rc<RefCell<Task>>)>,
     trace: bool
 }
@@ -722,42 +864,45 @@ impl DependencyChecker<'_> {
         }
     }
 
-    fn visit_dependencies(&mut self, node: &str, first_level: bool, indent: &str) -> Result<(),WorkshopError> {
-        self.trace(indent,format!("Visiting dependent task {node}"));
-        if self.marked.contains_key(node) {
-            self.trace(indent,format!("Task {node} already checked."));
+    fn visit_dependencies(&mut self, dependency: &TaskDependency, first_level: bool, indent: &str) -> Result<(),WorkshopError> {
+        let name = dependency.name();
+        let arguments = dependency.arguments();
+        self.trace(indent,format!("Visiting dependent task {name} arguments: {}",trace_args(arguments))); 
+        if self.marked.contains_key(dependency) {
+            self.trace(indent,format!("Task {name} already checked."));
             Ok(()) 
-        } else if self.cyclical_check.contains_key(node) {
-            Err(WorkshopError::CyclicalDependency(node.to_owned()))
-        } else if let Some(task_entry) = self.workshop.tasks.get(node) {
+        } else if self.cyclical_check.contains_key(dependency) {
+            Err(WorkshopError::CyclicalDependency(name.to_owned()))
+        } else if let Some(task_entry) = self.workshop.tasks.get(name) {
 
             if first_level && task_entry.internal() {
 
                 // this was a task "picked" by the user, but it is marked as internal and therefore not supposed to be called directly.
-                Err(WorkshopError::TaskIsNotAvailable(node.to_owned()))
+                Err(WorkshopError::TaskIsNotAvailable(name.to_owned()))
 
             } else {
 
-                let task = task_entry.prepare()?;
+                // leave it up to the preparation function to validate that arguments are passed and exist.
+                let task = task_entry.prepare(arguments).map_err(|err| WorkshopError::Prepare(name.to_owned(),err))?;
 
-                self.trace(indent,format!("Marking task {node} for cyclical check."));
-                self.cyclical_check.insert(node.to_owned(),task.clone());
+                self.trace(indent,format!("Marking task {name} for cyclical check."));
+                self.cyclical_check.insert(dependency.clone(),task.clone());
 
-                for task in &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(node.to_owned()))?.dependencies {
-                    self.visit_dependencies(task,false,&format!("  {indent}"))?;
+                for dependency in &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.dependencies {
+                    self.visit_dependencies(dependency,false,&format!("  {indent}"))?;
                 }
     
-                self.trace(indent,format!("Unmarking task {node} for cyclical check."));
+                self.trace(indent,format!("Unmarking task {name} for cyclical check."));
                 // it's no longer being checked, so remove it.
-                self.cyclical_check.remove(node).expect("This was just inserted, it should still be here.");
+                self.cyclical_check.remove(dependency).expect("This was just inserted, it should still be here.");
     
-                self.trace(indent,format!("Marking task {node} as checked."));
+                self.trace(indent,format!("Marking task {name} as checked."));
                 // If I had some sort of map that maintained an order of insert, I wouldn't need a separate marked set and list of tasks. But I feel like adding that sort of crate in would be overkill.
-                self.marked.insert(node.to_owned(),task.clone());
+                self.marked.insert(dependency.clone(),task.clone());
     
-                self.trace(indent,format!("Adding task {node} to list."));
+                self.trace(indent,format!("Adding task {name} to list."));
                 // all of its dependencies are already on the list, so this can go on now.
-                self.tasks.push((node.to_owned(),task));
+                self.tasks.push((name.to_owned(),task));
     
                 Ok(()) 
 
@@ -765,7 +910,7 @@ impl DependencyChecker<'_> {
 
 
         } else {
-            Err(WorkshopError::TaskDoesNotExist(node.to_owned()))
+            Err(WorkshopError::TaskDoesNotExist(name.to_owned()))
         }
 
 
@@ -773,10 +918,10 @@ impl DependencyChecker<'_> {
     }    
 
     /// Checks the dependencies of the specified task, and adds it and them to the list in an appropriate order, if they aren't already on the list. The list can be retrieved with take_output.
-    pub fn require_task(&mut self, node: &str) -> Result<(),WorkshopError> {
+    pub fn require_task(&mut self, name: String) -> Result<(),WorkshopError> {
         let indent = String::new();
-        self.trace(&indent,format!("Requiring task {node}."));
-        self.visit_dependencies(node, true, &indent)
+        self.trace(&indent,format!("Requiring task {name}."));
+        self.visit_dependencies(&TaskDependency::Simple(name), true, &indent)
     }
 
     /// Drops the checker and returns the generated list of tasks, as built during calls to [require_task].
@@ -861,7 +1006,11 @@ mod tests {
             // If this one causes an error, then the test failed.
         }).expect("Task should have been added.");
 
-        workshop.run_tasks(&["5","8","test-skip-missing"],false,false).expect("Tasks should have run.");
+        workshop.run_tasks(&ProgramOptions {
+            TASKS: vec!["5".to_owned(),"8".to_owned(),"test-skip-missing".to_owned()],
+            ..Default::default()
+        }).expect("Tasks should have run.");
+            //ProgramOptions::new(&["5","8","test-skip-missing"],false,false,false)).expect("Tasks should have run.");
 
         assert_eq!(result.take(),vec!["2","9","10","11","5","8"]);
         

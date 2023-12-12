@@ -11,8 +11,11 @@
 use rust_workshop::Workshop;
 use rust_workshop::duct::cmd;
 use rust_workshop::task;
+use rust_workshop::param_task;
 use rust_workshop::glob_cmd;
 use rust_workshop::glob_str;
+use rust_workshop::dep;
+use rust_workshop::multi_dep;
 use std::error::Error;
 
 
@@ -98,11 +101,46 @@ fn main() -> Result<(),Box<dyn Error>> {
         },
     })?;
 
+    workshop.add("test-zero-params",param_task!{
+        params: (),
+        help: "Test parameter task with no parameters",
+        command: cmd!("echo","---")
+    })?;
 
+    workshop.add("test-one-param",param_task!{
+        params: (foo),
+        help: "Test parameter task with no parameters",
+        dependencies: &[dep!("test-zero-params",)],
+        command: cmd!("echo",format!("{foo}"))
+    })?;
+
+    workshop.add("test-two-params",param_task!{
+        params: (foo,bar),
+        help: "Test parameter task with no parameters",
+        dependencies: &[dep!("test-one-param", "foo" => "Hello")],
+        command: cmd!("echo",foo,bar)
+    })?;
+
+    workshop.add("test-param-tasks", task!{
+        help: "Test all parameter tasks.",
+        dependencies: &[dep!("test-two-params", "foo" => "Hello", "bar" => "World")]
+        // If this one causes an error, then the test failed.
+    })?;
+
+    workshop.add("test-multi-dep-task", param_task!{
+        params: (foo,bar),
+        help: "Test a task that will be called as a multi_dep.",
+        command: cmd!("echo",bar,format!(" => {foo}"))
+    })?;
+
+    workshop.add("test-multi-dep",task!{
+        help: "Test multi_dep macro",
+        dependencies: &multi_dep!("test-multi-dep-task", "foo" => ["1","2","3","World"], "bar" => "Hello"),
+    })?;
 
     workshop.add("default", task!{
-        help: "Default task",
-        dependencies: &["5","8","test-skipping","test-glob"],
+        help: "Run all tests",
+        dependencies: &["5","8","test-skipping","test-glob","test-param-tasks","test-multi-dep"],
     })?;
 
     workshop.main()
