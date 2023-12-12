@@ -486,7 +486,7 @@ macro_rules! multi_dep {
     ($name: expr, $array_key: expr => $array_expr: expr $(, $key: expr => $value: expr)*  $(,)?) => {{
         let mut dependencies = Vec::new();
         for value in $array_expr {
-            dependencies.push(dep!($name,$array_key=>value $(, $key => $value)*))
+            dependencies.push($crate::dep!($name,$array_key=>value $(, $key => $value)*))
         }
         dependencies
     }};
