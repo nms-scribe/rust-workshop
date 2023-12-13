@@ -361,6 +361,9 @@ impl Command {
         // NOTE: By default, duct returns an error on non-zero status. However, the user could change that by marking it as unchecked.
         // I should allow them to do this. Duct will still error out on a killed process, so that's not a problem.
 
+        // Expression doesn't implement Display, and due to private fields there's no way to "discover" it's structure and create one, so Debug will have to do.
+        println!("* {command:?}");
+
         command.run()?;
 
         Ok(())
@@ -441,18 +444,22 @@ impl From<&str> for TaskDependency {
     }
 }
 
-fn trace_args(args: Option<&BTreeMap<String,String>>) -> String {
-    let mut result = String::new();
-    if let Some(args) = args {
-        for (key,value) in args {
-            result.push_str(&format!("{key} => '{value}' "));
-        }
-    } else {
-        result.push_str("None")
-    }
-    result
+impl Display for TaskDependency {
 
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskDependency::Simple(name) => write!(f,"{name}"),
+            TaskDependency::Arguments(name, args) => {
+                let mut result = String::new();
+                for (key,value) in args {
+                    result.push_str(&format!("{key} => '{value}' "));
+                }
+                write!(f,"{name}({result})")
+            },
+        }
+    }
 }
+
 
 #[macro_export]
 /// This macro can be used to make [TaskDependency]'s. Note that plain dependencies can often get by with String-like values, due to implementations of `From` for `TaskDependency`. However, if a dependency requires arguments, this macro will be more useful. To create such a dependency, pass the name, followed by comma separated pairs like `"key" => "value"`. To call a parameter task with zero parameters, simply add a comma after the task name.
@@ -683,29 +690,28 @@ impl Workshop {
 
         let mut task_list = self.calculate_dependency_list(&options.TASKS, options.trace_dependencies)?;
 
-        for (name,task) in &mut task_list {
+        for (task_id,task) in &mut task_list {
 
             let skip = if options.force {
                 false
-            } else if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.skip {
+            } else if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(format!("{task_id}")))?.skip {
                 if options.trace {
-                    println!("Checking if task '{name}' should be skipped.");
+                    println!("Checking if task '{task_id}' should be skipped.");
                 }
-                skip.must_skip(options.trace).map_err(|err| WorkshopError::Skip(name.clone(),err))?  
+                // TODO: I need the arguments in the error message...
+                skip.must_skip(options.trace).map_err(|err| WorkshopError::Skip(format!("{task_id}"),err))?  
             } else {
                 false
             };
 
             if !skip {
-                if options.trace {
-                    println!("Running task '{name}'.");
-                }
+                println!("# Task: '{task_id}'.");
 
-                for command in &mut task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrowMut(name.to_owned()))?.command {
-                    command.run().map_err(|err| WorkshopError::Command(name.clone(), err))?
+                for command in &mut task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrowMut(format!("{task_id}")))?.command {
+                    command.run().map_err(|err| WorkshopError::Command(format!("{task_id}"), err))?
                 }
             } else if options.trace {
-                println!("Skipping task '{name}'.");
+                println!("Skipping task '{task_id}'.");
             }
 
         }
@@ -823,7 +829,7 @@ impl Workshop {
 
     // No reason not to make this public. If the user wants to do some testing.
     /// This is called automatically by [Workshop::main] and [Workshop::run] to calculate dependencies for tasks from the command line. It returns a list of tasks which must be run to accomplish the passed tasks. The `trace` parameter specifies whether trace messages will be logged to stdout during this checking.
-    pub fn calculate_dependency_list<TaskName: Into<String> + Clone>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(String,Rc<RefCell<Task>>)>,WorkshopError> {
+    pub fn calculate_dependency_list<TaskName: Into<String> + Clone>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(TaskDependency,Rc<RefCell<Task>>)>,WorkshopError> {
         let mut checker = DependencyChecker::new(self, trace);
 
         for task in tasks {
@@ -841,7 +847,7 @@ pub struct DependencyChecker<'workshop> {
     workshop: &'workshop Workshop,
     marked: HashMap<TaskDependency,Rc<RefCell<Task>>>,
     cyclical_check: HashMap<TaskDependency,Rc<RefCell<Task>>>,
-    tasks: Vec<(String,Rc<RefCell<Task>>)>,
+    tasks: Vec<(TaskDependency,Rc<RefCell<Task>>)>,
     trace: bool
 }
 
@@ -867,9 +873,9 @@ impl DependencyChecker<'_> {
     fn visit_dependencies(&mut self, dependency: &TaskDependency, first_level: bool, indent: &str) -> Result<(),WorkshopError> {
         let name = dependency.name();
         let arguments = dependency.arguments();
-        self.trace(indent,format!("Visiting dependent task {name} arguments: {}",trace_args(arguments))); 
+        self.trace(indent,format!("Visiting dependent task '{dependency}'")); 
         if self.marked.contains_key(dependency) {
-            self.trace(indent,format!("Task {name} already checked."));
+            self.trace(indent,format!("Task {dependency} already checked."));
             Ok(()) 
         } else if self.cyclical_check.contains_key(dependency) {
             Err(WorkshopError::CyclicalDependency(name.to_owned()))
@@ -885,24 +891,24 @@ impl DependencyChecker<'_> {
                 // leave it up to the preparation function to validate that arguments are passed and exist.
                 let task = task_entry.prepare(arguments).map_err(|err| WorkshopError::Prepare(name.to_owned(),err))?;
 
-                self.trace(indent,format!("Marking task {name} for cyclical check."));
+                self.trace(indent,format!("Marking task {dependency} for cyclical check."));
                 self.cyclical_check.insert(dependency.clone(),task.clone());
 
                 for dependency in &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.dependencies {
                     self.visit_dependencies(dependency,false,&format!("  {indent}"))?;
                 }
     
-                self.trace(indent,format!("Unmarking task {name} for cyclical check."));
+                self.trace(indent,format!("Unmarking task {dependency} for cyclical check."));
                 // it's no longer being checked, so remove it.
                 self.cyclical_check.remove(dependency).expect("This was just inserted, it should still be here.");
     
-                self.trace(indent,format!("Marking task {name} as checked."));
+                self.trace(indent,format!("Marking task {dependency} as checked."));
                 // If I had some sort of map that maintained an order of insert, I wouldn't need a separate marked set and list of tasks. But I feel like adding that sort of crate in would be overkill.
                 self.marked.insert(dependency.clone(),task.clone());
     
-                self.trace(indent,format!("Adding task {name} to list."));
+                self.trace(indent,format!("Adding task {dependency} to list."));
                 // all of its dependencies are already on the list, so this can go on now.
-                self.tasks.push((name.to_owned(),task));
+                self.tasks.push((dependency.clone(),task));
     
                 Ok(()) 
 
@@ -925,7 +931,7 @@ impl DependencyChecker<'_> {
     }
 
     /// Drops the checker and returns the generated list of tasks, as built during calls to [require_task].
-    fn into_tasks(self) -> Vec<(String,Rc<RefCell<Task>>)> {
+    fn into_tasks(self) -> Vec<(TaskDependency,Rc<RefCell<Task>>)> {
         self.tasks
     }
 
