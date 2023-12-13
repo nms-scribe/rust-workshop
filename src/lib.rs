@@ -552,6 +552,13 @@ impl Task {
         self.add_command(Command::Command(command))
     }
 
+    /// Allows adding a number of commands at once. See [Task::command].
+    pub fn commands<Expressions: IntoIterator<Item=Expression>>(&mut self, commands: Expressions) {
+        for command in commands {
+            self.add_command(Command::Command(command))
+        }
+    }
+
     /// Tells the task that it should skip if the files in `source` are older than the files in `target`. See [Skip::IfOlderThan].
     pub fn skip_if_older_than<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
         let source = source.iter().map(|path| path.clone().into()).collect();

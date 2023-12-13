@@ -76,8 +76,8 @@ fn main() -> Result<(),Box<dyn Error>> {
     workshop.add("transform-file", task!{
         help: "Transform the file.",
         dependencies: &["create-file"],
-        command: cmd!("sleep","0.2"), // ensures that there is a delay in the time, so skipping works.
-        command: cmd!("cp","test_one.txt","test_two.txt"),
+        commands: [cmd!("sleep","0.2"), // ensures that there is a delay in the time, so skipping works.
+                   cmd!("cp","test_one.txt","test_two.txt")],
     })?;
 
     workshop.add("test-skipping", task!{
