@@ -452,7 +452,10 @@ impl Display for TaskDependency {
             TaskDependency::Arguments(name, args) => {
                 let mut result = String::new();
                 for (key,value) in args {
-                    result.push_str(&format!("{key} => '{value}' "));
+                    if !result.is_empty() {
+                        result.push_str(", ")
+                    }
+                    result.push_str(&format!("{key}=>'{value}'"));
                 }
                 write!(f,"{name}({result})")
             },
@@ -641,14 +644,17 @@ macro_rules! task {
 }
 
 #[macro_export]
-/// This macro allows creation of a task with parameters. It is very similar to the [task!] macro, except that it includes a required field call parameters. The parameters specified in the name can be used in `format!` calls in the expressions specified for the other fields.
+/// This macro allows creation of a task with parameters. It is very similar to the [task!] macro, except that it includes a required field call parameters. The parameters specified in the name can be used in `format!` calls in the expressions specified for the other fields. In addition, you can also specify `var` fields which can be used in the fields, with values based on param values.
 macro_rules! param_task {
-    (params: ($($param: ident),*), help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
+    (params: ($($param: ident),*), $(var: ($var: ident => $var_value: expr) ,)* help: $help: expr, $($key: ident $(: $value: expr)?),* $(,)?) => {{
         let task = $crate::ParameterTask::new(|_map| {
             $(
                 let $param = _map.get(stringify!($param)).ok_or_else(|| -> Box<dyn Error> {
                      Box::from(concat!("Value not passed for parameter '",stringify!($param),"'."))
                 })?;
+            )*
+            $(
+                let $var = $var_value;
             )*
             Ok(task!(@task help: $help, $($key $(: $value)?),*))
 

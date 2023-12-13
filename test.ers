@@ -129,8 +129,9 @@ fn main() -> Result<(),Box<dyn Error>> {
 
     workshop.add("test-multi-dep-task", param_task!{
         params: (foo,bar),
+        var: (oof => format!("!{foo}!")),
         help: "Test a task that will be called as a multi_dep.",
-        command: cmd!("echo",bar,format!(" => {foo}"))
+        command: cmd!("echo",bar,format!(" => {oof}"))
     })?;
 
     workshop.add("test-multi-dep",task!{
