@@ -8,7 +8,7 @@ use core::fmt::Display;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs::metadata;
+use std::fs::symlink_metadata;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::rc::Rc;
@@ -271,7 +271,8 @@ impl Skip {
     pub fn get_max_modified_time_for(source: &[PathBuf], ignore_missing: bool) -> Result<Option<SystemTime>, std::io::Error> {
         let mut result = None;
         for source in source {
-            let metadata = metadata(source);
+            // don't traverse symlinks, there's a possibility that the command is trying to create a link.
+            let metadata = symlink_metadata(source);
             let metadata = if ignore_missing && metadata.is_err() {
                 continue;
             } else {
