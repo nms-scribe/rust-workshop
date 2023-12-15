@@ -134,10 +134,20 @@ fn main() -> Result<(),Box<dyn Error>> {
         command: cmd!("echo",bar,format!(" => {oof}"))
     })?;
 
+    // testing hook_cmd, this one only hooks onto a task with specific arguments.
+    workshop.hook_cmd(dep!("test-multi-dep-task","foo"=>"2", "bar" => "Hello"),cmd!("echo","hooked onto 2"));
+
+    workshop.hook_fun(dep!("test-multi-dep-task","foo"=>"3", "bar" => "Hello"),|| {
+        println!("HOOKED ONTO ONLY 3");
+        Ok(())
+    });
+
     workshop.add("test-multi-dep",task!{
         help: "Test multi_dep macro",
-        dependencies: &multi_dep!("test-multi-dep-task", "foo" => ["1","2","3","World"], "bar" => "Hello"),
     })?;
+
+    // testing hook_deps
+    workshop.hook_deps("test-multi-dep",&multi_dep!("test-multi-dep-task", "foo" => ["1","2","3","World"], "bar" => "Hello"));
 
     workshop.add("default", task!{
         help: "Run all tests",

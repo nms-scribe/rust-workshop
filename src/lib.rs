@@ -559,6 +559,16 @@ impl Task {
         }
     }
 
+    fn add_hooks(&mut self, hooks: &Vec<Hook>) {
+        for hook in hooks {
+            match hook {
+                Hook::Dependency(dependency) => self.dependency(dependency.clone()),
+                Hook::Command(command) => self.add_command(command.clone()),
+            }
+        }
+
+    }
+
     /// Tells the task that it should skip if the files in `source` are older than the files in `target`. See [Skip::IfOlderThan].
     pub fn skip_if_older_than<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
         let source = source.iter().map(|path| path.clone().into()).collect();
@@ -670,6 +680,18 @@ macro_rules! param_task {
     }};
 }
 
+/**
+A hook is a useful way to extend the capabilities of an existing [Workshop], or to add on to tasks for a specific file. If you have a shared script which initializes tasks for several projects using the same framework, but there is one project for which you need an additional command, you can use a hook to add that command. Or, if you have a dependency required for a param_task, that is only needed for certain files, you can hook that dependency on to just that instance.
+
+Hooks can be added for a task by name, or a task with arguments. If specified by name, the hook will be added to all instances of the task, regardless of arguments. If specified with arguments, the hook is only added for tasks whose arguments match the specified ones. There are no partial matches for arguments.
+
+Dependencies and commands are hooked at the end of the current list. If you wish to run a command before the others, use a dependency hook and add a new dependency with that command. To make a dependency run earlier, hook it onto another dependency of that task instead.
+*/
+pub enum Hook {
+    Dependency(TaskDependency),
+    Command(Command)
+}
+
 #[derive(Default)]
 /**
 A Workshop object represents a set of tasks to run, and contains functionality for building and running these tasks. 
@@ -677,7 +699,8 @@ A Workshop object represents a set of tasks to run, and contains functionality f
 The easiest way to work with a workshop is by creating a rust-script, or a full-fledged binary project if you want to. In the main function of your script, create the workshop with [Workshop::new], add tasks to it with [Workshop::add] and the [task!] macro, and then call [Workshop::main], which will collect the arguments from the command line.
 */
 pub struct Workshop {
-    tasks: HashMap<String,TaskEntry>
+    tasks: HashMap<String,TaskEntry>,
+    hooks: HashMap<TaskDependency,Vec<Hook>>
 }
 
 impl Workshop {
@@ -696,6 +719,37 @@ impl Workshop {
             Ok(())
         }
 
+    }
+
+    fn hook(&mut self, task: TaskDependency, hook: Hook) {
+        if let Some(hooks) = self.hooks.get_mut(&task) {
+            hooks.push(hook)
+        } else {
+            self.hooks.insert(task, vec![hook]);
+        }
+
+    }
+
+    /// Adds a hook which will cause a list of new dependencies to be added to the target task after it is prepared. The dependencies are added after any previously existing dependencies. The target can be a single name, or it can have a list of arguments. In the former case, it will be added to all instances of a task with that name, regardless of parameters. In the latter, it will only be added to tasks whose passed arguments match those mentioned.
+    pub fn hook_deps<Target: Into<TaskDependency> + Clone, Dependency: Into<TaskDependency> + Clone>(&mut self, target: Target, dependencies: &[Dependency]) {
+        for dependency in dependencies {
+            self.hook_dep(target.clone(), dependency.clone())
+        }
+    }
+
+    /// Adds a hook which will cause a new dependency to be added to the target task after it is prepared. The dependency is added after any previously existing dependencies. The target can be a single name, or it can have a list of arguments. In the former case, it will be added to all instances of a task with that name, regardless of parameters. In the latter, it will only be added to tasks whose passed arguments match those mentioned.
+    pub fn hook_dep<Target: Into<TaskDependency> + Clone, Dependency: Into<TaskDependency> + Clone>(&mut self, target: Target, dependency: Dependency) {
+        self.hook(target.into(), Hook::Dependency(dependency.into()))
+    }
+
+    /// Adds a hook which will cause a function to be added to the target task's commands after it is prepared. The function is added after any previously existing commands and functions. The target can be a single name, or it can have a list of arguments. In the former case, it will be added to all instances of a task with that name, regardless of parameters. In the latter, it will only be added to tasks whose passed arguments match those mentioned.
+    pub fn hook_fun<Target: Into<TaskDependency> + Clone, Function: FnMut() -> Result<(),Box<dyn Error>>+ 'static>(&mut self, target: Target, function: Function) {
+        self.hook(target.into(), Hook::Command(Command::Function(Rc::new(RefCell::new(Box::from(function))))))
+    }
+
+    /// Adds a hook which will cause a command expression to be added to the target task's commands after it is prepared. The command is added after any previously existing commands and functions. The target can be a single name, or it can have a list of arguments. In the former case, it will be added to all instances of a task with that name, regardless of parameters. In the latter, it will only be added to tasks whose passed arguments match those mentioned.
+    pub fn hook_cmd<Target: Into<TaskDependency> + Clone>(&mut self, target: Target, command: Expression) {
+        self.hook(target.into(), Hook::Command(Command::Command(command)))
     }
 
     /// Call this function to run tasks directly. Specify the tasks to run under `tasks`. If `trace_dependencies` is true, messages will be printed to stdout during dependency calculation. If `trace_commands` is true, messages will be printed to stdout during command processing.
@@ -904,6 +958,20 @@ impl DependencyChecker<'_> {
                 // leave it up to the preparation function to validate that arguments are passed and exist.
                 let task = task_entry.prepare(arguments).map_err(|err| WorkshopError::Prepare(name.to_owned(),err))?;
 
+                // look for dependency specific hooks and add them.
+                if let Some(hooks) = self.workshop.hooks.get(dependency) {
+                    task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.add_hooks(hooks);
+                }
+
+                // look for name based hooks and add them
+                if let TaskDependency::Arguments(name,_) = dependency {
+                    if let Some(hooks) = self.workshop.hooks.get(&TaskDependency::Simple(name.clone())) {
+                        task.try_borrow_mut().map_err(|_| WorkshopError::TaskBorrow(name.to_owned()))?.add_hooks(hooks);
+                    }
+                }
+
+                
+
                 self.trace(indent,format!("Marking task {dependency} for cyclical check."));
                 self.cyclical_check.insert(dependency.clone(),task.clone());
 
@@ -989,10 +1057,12 @@ mod tests {
         let output = result.clone();
         workshop.add("11",task!{
             help: "Eleven",
-            dependencies: &["2","9","10"],
+            dependencies: &["2","9"],
             function: move || {output.borrow_mut().push("11"); Ok(( ))},
         }).expect("Task should have been added.");
 
+        // test adding a hook
+        workshop.hook_dep("11", "10");
 
         let output = result.clone();
         workshop.add("8", task!{
