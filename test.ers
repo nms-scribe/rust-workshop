@@ -83,9 +83,11 @@ fn main() -> Result<(),Box<dyn Error>> {
     workshop.add("test-skipping", task!{
         help: "Test if skipping works.",
         dependencies: &["transform-file"],
-        skip_if_older_than: (&["test_one.txt"],&["test_two.txt"]),
+        input_checks: &["test_one.txt"],
         function: || Err("test-skipping should have been skipped".into()),
     })?;
+
+    workshop.hook_output("test-skipping",&["test_two.txt"]);
 
     workshop.add("test-glob", task!{
         help: "Test if glob star expressions work.",

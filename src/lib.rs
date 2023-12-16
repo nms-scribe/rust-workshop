@@ -60,32 +60,6 @@ impl From<BorrowMutError> for CommandError {
     }
 }
 
-
-
-#[derive(Debug)]
-/// An error which could be returned during testing if a task should be skipped. This is wrapped in [WorkshopError::Skip].
-pub enum SkipError {
-    /// An i/o error caused by a failure to check information about files.
-    IOError(std::io::Error),
-    /// An error returned from a skip function
-    Function(Box<dyn Error>),
-}
-
-impl Error for SkipError {
-
-}
-
-
-impl Display for SkipError {
-
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SkipError::IOError(err) => write!(f,"{err}"),
-            SkipError::Function(err) => write!(f,"from function: {err}"),
-        }
-    }
-}
-
 #[derive(Debug)]
 /// An error returned while globbing a string
 pub enum GlobError {
@@ -154,8 +128,8 @@ impl From<Box<dyn Error>> for PrepareError {
 #[derive(Debug)]
 /// An error associated with [Workshop].
 pub enum WorkshopError {
-    /// This is returned if an error occurs while checking if a task should be skipped.
-    Skip(String,SkipError),
+    /// This is an io error returned if an error occurs while checking if a task should be skipped.
+    Skip(String,std::io::Error),
     /// This is returned if an error occurs while running a task's command.
     Command(String, CommandError),
     /// This is returned by globbing functionality if an error occurs
@@ -222,68 +196,28 @@ impl From<gumdrop::Error> for WorkshopError {
     }
 }
 
-/// A Skip object represents a method used for checking if a task should be skipped.
-#[derive(Clone)]
-pub enum Skip {
-    /// In this method, a function is called which returns a bool or an error. If `Ok(true)` is returned, the task will be skipped. If an error is returned, the whole process will fail.
-    Function(Rc<dyn Fn() -> Result<bool,Box<dyn Error>>>),
-    /// In this method, the modified times of the files in `source` are compared to those of `target`. If all of the files in `source` are older than the newest file in `target`, the task shall be skipped.
-    IfOlderThan{
-        source: Vec<PathBuf>,
-        target: Vec<PathBuf>
+/**
+Finds the timestamp of the newest file in the specified list, and returns that timestamp. Returns none if the list is empty or if the timestamp can not be found. The checks can result in an io error. 
+
+Pass `true` to `none_if_missing` if you want it to ignore a `NotFound` error, and return None instead. This would be done in the target check to indicate that the task should not be skipped because target files are missing. In the source check, a missing file should cause an error here, as it might mean a previous task lied about its success.
+*/
+pub fn get_max_modified_time_for(source: &[PathBuf], none_if_missing: bool) -> Result<Option<SystemTime>, std::io::Error> {
+    let mut result = None;
+    for source in source {
+        // don't traverse symlinks, there's a possibility that the command is trying to create a link.
+        let metadata = symlink_metadata(source);
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(err) if none_if_missing => match err.kind() {
+                std::io::ErrorKind::NotFound => return Ok(None),
+                _ => return Err(err)
+            },
+            Err(err) => return Err(err)
+        };
+        let source_time = metadata.modified()?;
+        result = result.max(Some(source_time));
     }
-}
-
-impl Skip {
-
-    /// Runs the appropriate skip process. Returns true if the task must be skipped, false if it shouldn't. Any error which occurs during the processing will cause an error to return.
-    pub fn must_skip(&self, trace: bool) -> Result<bool, SkipError> {
-        match self {
-            Skip::Function(function) => (function)().map_err(SkipError::Function),
-            Skip::IfOlderThan { source, target } => Self::must_skip_if_older_than(source,target,trace).map_err(SkipError::IOError)
-        }
-    }
-
-    /// Checks the files in `source` against the files in `target`. If all of the files in `source` are older than the newest file in `target`, true is returned. Otherwise, false is returned, unless an IO error occurs while checking the data.
-    pub fn must_skip_if_older_than(source: &[PathBuf], target: &[PathBuf], trace: bool) -> Result<bool, std::io::Error> {
-        let source_time = Self::get_max_modified_time_for(source,false)?;
-        if trace {
-            println!("source time: {source_time:?}");
-        }
-        let target_time = Self::get_max_modified_time_for(target,true)?;
-        if trace {
-            println!("target time: {target_time:?}");
-        }
-        let skip = source_time < target_time;
-        if trace {
-            if skip {
-                println!("source time is less than target time, will skip.")
-            } else {
-                println!("source time is not less than target time, will not skip.")
-            }
-        }
-
-        Ok(skip)
-
-    }
-
-    /// Finds the timestamp of the newest file in the specified list, and returns that timestamp. Returns none if the list is empty or if the timestamp can not be found. If an io error occurs during checking, that is returned. Pass `false` to `ignore_missing` if you want it to ignore missing files, which probably should be done for target files.
-    pub fn get_max_modified_time_for(source: &[PathBuf], ignore_missing: bool) -> Result<Option<SystemTime>, std::io::Error> {
-        let mut result = None;
-        for source in source {
-            // don't traverse symlinks, there's a possibility that the command is trying to create a link.
-            let metadata = symlink_metadata(source);
-            let metadata = if ignore_missing && metadata.is_err() {
-                continue;
-            } else {
-                metadata?
-            };
-            let source_time = metadata.modified()?;
-            result = result.max(Some(source_time));
-        }
-        Ok(result)
-    }
-
+    Ok(result)
 }
 
 /// An enum which can either be a regular string, or a string meant to be a glob pattern. Use [glob_str] to create a pattern, or [Into] to convert a regular `string` or `&str` into a non-pattern string.
@@ -341,11 +275,13 @@ macro_rules! glob_cmd {
     };
 }
 
+type CommandFunction = dyn FnMut() -> Result<(),Box<dyn Error>>;
+
 /// Represents a method for running a command for a task.
 #[derive(Clone)]
 pub enum Command {
     /// The command is encapsulated in a function that takes no parameters, and returns a result.
-    Function(Rc<RefCell<dyn FnMut() -> Result<(),Box<dyn Error>>>>),
+    Function(Rc<RefCell<CommandFunction>>),
     // You know, I could technically turn this into a function as well... I just feel like the
     // abstraction isn't necessary and the additional 'dyn' boundary might complicate things. Plus more useful error...
     /// The command is a subprocess command, represented by [duct::Expression]. Use [duct::cmd()] or [duct::cmd!()] to build this expression, and functions on `Expression` to add things like piping and redirecting.
@@ -509,7 +445,8 @@ pub struct Task {
     help: String,
     dependencies: Vec<TaskDependency>,
     command: Vec<Command>,
-    skip: Option<Skip>,
+    input_file_checks: Vec<PathBuf>,
+    output_file_checks: Vec<PathBuf>,
     internal: bool
 }
 
@@ -521,7 +458,8 @@ impl Task {
             help: help.into(),
             dependencies: Vec::new(),
             command: Vec::new(),
-            skip: None,
+            input_file_checks: Vec::new(),
+            output_file_checks: Vec::new(),
             internal: false
         }
 
@@ -565,21 +503,27 @@ impl Task {
             match hook {
                 Hook::Dependency(dependency) => self.dependency(dependency.clone()),
                 Hook::Command(command) => self.add_command(command.clone()),
+                Hook::Input(files) => self.input_checks(&files),
+                Hook::Output(files) => self.output_checks(&files)
             }
         }
 
     }
 
-    /// Tells the task that it should skip if the files in `source` are older than the files in `target`. See [Skip::IfOlderThan].
-    pub fn skip_if_older_than<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
-        let source = source.iter().map(|path| path.clone().into()).collect();
-        let target = target.iter().map(|path| path.clone().into()).collect();
-        self.skip = Some(Skip::IfOlderThan { source, target });
+    /// input_checks are filenames whose timestamps will be checked to see if the task should be skipped. See [Task::must_skip].
+    pub fn input_checks<Path: Into<PathBuf> + Clone>(&mut self, inputs: &[Path]) {
+        self.input_file_checks.extend(inputs.iter().map(|path| path.clone().into()));
     }
 
-    /// Tells the task that it should skip based on the result of the specified function. See [Skip::Function].
-    pub fn skip<Function: Fn() -> Result<bool,Box<dyn Error>>+ 'static>(&mut self, function: Function) {
-        self.skip = Some(Skip::Function(Rc::from(function)));
+    pub fn output_checks<Path: Into<PathBuf> + Clone>(&mut self, outputs: &[Path]) {
+        self.output_file_checks.extend(outputs.iter().map(|path| path.clone().into()));
+    }
+
+    #[deprecated = "Use input_checks and output_checks instead."]
+    /// Tells the task that it should skip if the files in `source` are older than the files in `target`. This simply adds source files to input_checks and output files to output_checks.
+    pub fn skip_if_older_than<Path: Into<PathBuf> + Clone>(&mut self, source: &[Path], target: &[Path]) {
+        self.input_checks(source);
+        self.output_checks(target);
     }
 
     /// Marks the task as internal. Internal tasks can not be called from the command line, nor are they listed. However, they may be used as dependencies of non-internal tasks.
@@ -587,11 +531,41 @@ impl Task {
         self.internal = true;
     }
 
+    /**
+    Checks timestamps of input_checks and output_checks files. Returns true if the task must be skipped, false if it shouldn't. Any io error which occurs during the processing will cause an error to return. A task must be skipped if the newest file in input_checks is older than the newest file in output_checks. Times are compared without following symbolic links. 
+    
+    The timestamp check returns an Option, with the newest timestamp returned as Some. If there are no output files to check, the timestamp check will return None for output. It will also return None if any of the files do not exist. If there are no input files to check, the timestamp check will return None for input. However, if any files are missing, an io error will be returned.
+
+    This use of an option works, as returning Some() from input will always be newer than a None returned from outputs. Plus, if both lists are empty, None will returned by both, which is never less than None, which means the task will not be skipped. The only case where this might be a problem is if the input list is empty, but the output list has files that exist, in which case the task will always be skipped. This is a logic error, as there is no benefit to having output checks without input checks.
+    */
+    pub fn must_skip(&self, trace: bool) -> Result<bool, std::io::Error> {
+        let source_time = get_max_modified_time_for(&self.input_file_checks,false)?;
+        if trace {
+            println!("source time: {source_time:?}");
+        }
+        let target_time = get_max_modified_time_for(&self.output_file_checks,true)?;
+        if trace {
+            println!("target time: {target_time:?}");
+        }
+        let skip = source_time < target_time;
+        if trace {
+            if skip {
+                println!("source time is less than target time, will skip.")
+            } else {
+                println!("source time is not less than target time, will not skip.")
+            }
+        }
+        Ok(skip)
+    }
+
+
 }
+
+type ParameterTaskFunction = dyn Fn(&BTreeMap<String,String>) -> Result<Task,Box<dyn Error>>;
 
 /// A Parameter Task describes a function which can return a task given a set of named arguments. The easiest way to create one is to use [param_task!]
 pub struct ParameterTask {
-    template: Box<dyn Fn(&BTreeMap<String,String>) -> Result<Task,Box<dyn Error>>>
+    template: Box<ParameterTaskFunction>
 }
 
 impl ParameterTask {
@@ -642,6 +616,9 @@ impl TaskEntry {
 #[macro_export]
 /// The task macro allows you to use something like a struct-constructor syntax to create a task. A 'help' property is the only one required. The other available properties are the same as the methods on [Task], and the values are passed to those functions. The `skip_if_older_than` method can be used by wrapping the two arguments in parentheses, like a tuple.
 macro_rules! task {
+    (@key $task: ident, must_skip: $value: expr) => {
+        compile_error!("must_skip can not be called with task macro.")
+    };
     (@key $task: ident, skip_if_older_than: $value: expr) => {
         $task.skip_if_older_than($value.0,$value.1)
     };
@@ -684,14 +661,17 @@ macro_rules! param_task {
 /**
 A hook is a useful way to extend the capabilities of an existing [Workshop], or to add on to tasks for a specific file. If you have a shared script which initializes tasks for several projects using the same framework, but there is one project for which you need an additional command, you can use a hook to add that command. Or, if you have a dependency required for a param_task, that is only needed for certain files, you can hook that dependency on to just that instance.
 
-Hooks can be added for a task by name, or a task with arguments. If specified by name, the hook will be added to all instances of the task, regardless of arguments. If specified with arguments, the hook is only added for tasks whose arguments match the specified ones. There are no partial matches for arguments.
+A hook can add a new dependency, command, input_check or output_check to a task after it has been prepared. Hooks can be added for a task by name, or a task with arguments. If specified by name, the hook will be added to all instances of the task, regardless of arguments. If specified with arguments, the hook is only added for tasks whose arguments match the specified ones. There are no partial matches for arguments.
 
-Dependencies and commands are hooked at the end of the current list. If you wish to run a command before the others, use a dependency hook and add a new dependency with that command. To make a dependency run earlier, hook it onto another dependency of that task instead.
+All new items are hooked into the end of the current list. If you wish to hook a command to be run before the others, use a dependency hook and add a new dependency with that command. To make a dependency run earlier, hook it onto prior dependency.
 */
 pub enum Hook {
     Dependency(TaskDependency),
-    Command(Command)
+    Command(Command),
+    Input(Vec<PathBuf>),
+    Output(Vec<PathBuf>)
 }
+
 
 #[derive(Default)]
 /**
@@ -753,6 +733,14 @@ impl Workshop {
         self.hook(target.into(), Hook::Command(Command::Command(command)))
     }
 
+    pub fn hook_input<Target: Into<TaskDependency> + Clone, Path: Into<PathBuf> + Clone>(&mut self, target: Target, inputs: &[Path]) {
+        self.hook(target.into(), Hook::Input(inputs.iter().map(|p| p.clone().into()).collect()))
+    }
+
+    pub fn hook_output<Target: Into<TaskDependency> + Clone, Path: Into<PathBuf> + Clone>(&mut self, target: Target, outputs: &[Path]) {
+        self.hook(target.into(), Hook::Output(outputs.iter().map(|p| p.clone().into()).collect()))
+    }
+
     /// Call this function to run tasks directly. Specify the tasks to run under `tasks`. If `trace_dependencies` is true, messages will be printed to stdout during dependency calculation. If `trace_commands` is true, messages will be printed to stdout during command processing.
     pub fn run_tasks(&mut self, options: &ProgramOptions) -> Result<(),WorkshopError> {
 
@@ -762,14 +750,11 @@ impl Workshop {
 
             let skip = if options.force {
                 false
-            } else if let Some(skip) = &task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(format!("{task_id}")))?.skip {
+            } else {
                 if options.trace {
                     println!("Checking if task '{task_id}' should be skipped.");
                 }
-                // TODO: I need the arguments in the error message...
-                skip.must_skip(options.trace).map_err(|err| WorkshopError::Skip(format!("{task_id}"),err))?  
-            } else {
-                false
+                task.try_borrow().map_err(|_| WorkshopError::TaskBorrow(format!("{task_id}")))?.must_skip(options.trace).map_err(|err| WorkshopError::Skip(format!("{task_id}"),err))?
             };
 
             if !skip {
@@ -897,7 +882,7 @@ impl Workshop {
 
     // No reason not to make this public. If the user wants to do some testing.
     /// This is called automatically by [Workshop::main] and [Workshop::run] to calculate dependencies for tasks from the command line. It returns a list of tasks which must be run to accomplish the passed tasks. The `trace` parameter specifies whether trace messages will be logged to stdout during this checking.
-    pub fn calculate_dependency_list<TaskName: Into<String> + Clone>(&self, tasks: &[TaskName], trace: bool) -> Result<Vec<(TaskDependency,Rc<RefCell<Task>>)>,WorkshopError> {
+    pub fn calculate_dependency_list<TaskName: Into<String> + Clone>(&self, tasks: &[TaskName], trace: bool) -> Result<DependencyList,WorkshopError> {
         let mut checker = DependencyChecker::new(self, trace);
 
         for task in tasks {
@@ -910,12 +895,14 @@ impl Workshop {
     }
 }
 
+type DependencyList = Vec<(TaskDependency,Rc<RefCell<Task>>)>;
+
 /// This is used by the workshop to calculate dependencies. It is intended for advanced usage only.
 pub struct DependencyChecker<'workshop> {
     workshop: &'workshop Workshop,
     marked: HashMap<TaskDependency,Rc<RefCell<Task>>>,
     cyclical_check: HashMap<TaskDependency,Rc<RefCell<Task>>>,
-    tasks: Vec<(TaskDependency,Rc<RefCell<Task>>)>,
+    tasks: DependencyList,
     trace: bool
 }
 
@@ -1013,7 +1000,7 @@ impl DependencyChecker<'_> {
     }
 
     /// Drops the checker and returns the generated list of tasks, as built during calls to [require_task].
-    fn into_tasks(self) -> Vec<(TaskDependency,Rc<RefCell<Task>>)> {
+    fn into_tasks(self) -> DependencyList {
         self.tasks
     }
 
@@ -1092,7 +1079,8 @@ mod tests {
 
         workshop.add("test-skip-missing", task!{
             help: "Test skipping a missing file",
-            skip_if_older_than: (&["src/lib.rs"],&["src/lib.txt"]),
+            input_checks: &["src/lib.rs"],
+            output_checks: &["src/lib.txt"],
             // If this one causes an error, then the test failed.
         }).expect("Task should have been added.");
 
