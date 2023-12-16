@@ -201,7 +201,7 @@ Finds the timestamp of the newest file in the specified list, and returns that t
 
 Pass `true` to `none_if_missing` if you want it to ignore a `NotFound` error, and return None instead. This would be done in the target check to indicate that the task should not be skipped because target files are missing. In the source check, a missing file should cause an error here, as it might mean a previous task lied about its success.
 */
-pub fn get_max_modified_time_for(source: &[PathBuf], none_if_missing: bool) -> Result<Option<SystemTime>, std::io::Error> {
+pub fn get_max_modified_time_for(source: &[PathBuf], none_if_missing: bool, trace: bool) -> Result<Option<SystemTime>, std::io::Error> {
     let mut result = None;
     for source in source {
         // don't traverse symlinks, there's a possibility that the command is trying to create a link.
@@ -209,13 +209,21 @@ pub fn get_max_modified_time_for(source: &[PathBuf], none_if_missing: bool) -> R
         let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(err) if none_if_missing => match err.kind() {
-                std::io::ErrorKind::NotFound => return Ok(None),
+                std::io::ErrorKind::NotFound => {
+                    if trace {
+                        println!("file {source:?} is missing. Max timestamp is None.")
+                    }
+                    return Ok(None)
+                },
                 _ => return Err(err)
             },
             Err(err) => return Err(err)
         };
         let source_time = metadata.modified()?;
         result = result.max(Some(source_time));
+    }
+    if trace {
+        println!("Max timestamp is {result:?}")
     }
     Ok(result)
 }
@@ -534,19 +542,35 @@ impl Task {
     /**
     Checks timestamps of input_checks and output_checks files. Returns true if the task must be skipped, false if it shouldn't. Any io error which occurs during the processing will cause an error to return. A task must be skipped if the newest file in input_checks is older than the newest file in output_checks. Times are compared without following symbolic links. 
     
-    The timestamp check returns an Option, with the newest timestamp returned as Some. If there are no output files to check, the timestamp check will return None for output. It will also return None if any of the files do not exist. If there are no input files to check, the timestamp check will return None for input. However, if any files are missing, an io error will be returned.
+    The timestamp check returns an Option, with the newest timestamp returned as Some. None will be returned if a list is empty. In addition, if any of the output files are missing, None will also be returned. (If any of the input files are missing, however, an io error is returned and this function also returns that error.
+    
+    This option comparison works for the needs here, but I should make it clear what it means. The following table shows what happens with various states of input and output states. For the states in the table below, "empty" means a list is empty, "present" means a list has files in it and all files exist, "missing" means the list has files in it and at least one file does not exist.
 
-    This use of an option works, as returning Some() from input will always be newer than a None returned from outputs. Plus, if both lists are empty, None will returned by both, which is never less than None, which means the task will not be skipped. The only case where this might be a problem is if the input list is empty, but the output list has files that exist, in which case the task will always be skipped. This is a logic error, as there is no benefit to having output checks without input checks.
+    | Input   | Output  | Comparison   | Result                                                        |
+    |---------|---------|--------------|---------------------------------------------------------------|
+    | empty   | empty   | None == None | Task will never be skipped[^1]                                |
+    | empty   | missing | None == None | Task will not be skipped if the output files do not exist[^2] |
+    | empty   | present | None < Some  | Task will be skipped if the output files do exist[^2]         |
+    | missing | --      | Error        | An error occurs and the task will fail.[^3]                   |
+    | present | empty   | Some > None  | Task will never be skipped.[^4]                               |
+    | present | missing | Some > None  | Task will not be skipped.                                     |
+    | present | present | Some ? Some  | Task will be skipped if input < output.                       |
+
+    [^1]: This means that you do not need to use this property at all for tasks which do not need to be skipped, or tasks which call commands that handle their own file comparisons.
+    [^2]: Leaving the input files empty is useful for tasks which should only create a file if they don't exist. 
+    [^3]: If an input file is missing, it might imply a misconfiguration such as a missing dependency or improperly written command.
+    [^4]: This configuration is useful if you want to make sure a file exists before a task is run, for example if the task depends on something happening outside of the build file's control.
+
     */
     pub fn must_skip(&self, trace: bool) -> Result<bool, std::io::Error> {
-        let source_time = get_max_modified_time_for(&self.input_file_checks,false)?;
         if trace {
-            println!("source time: {source_time:?}");
+            println!("checking max modified time for input.");
         }
-        let target_time = get_max_modified_time_for(&self.output_file_checks,true)?;
+        let source_time = get_max_modified_time_for(&self.input_file_checks,false, trace)?;
         if trace {
-            println!("target time: {target_time:?}");
+            println!("checking max modified time for output.");
         }
+        let target_time = get_max_modified_time_for(&self.output_file_checks,true, trace)?;
         let skip = source_time < target_time;
         if trace {
             if skip {
