@@ -299,7 +299,7 @@ pub enum Command {
 impl Command {
 
     /// Runs a [duct::Expression], returning a `Result` based on the success of running that.
-    pub fn run_process(command: &Expression) -> Result<(),std::io::Error> {
+    pub fn run_process(command: &Expression) -> Result<(),CommandError> {
         // NOTE: If the command was built with Expression::stdout_capture or Expression::stderr_capture, that data will be discarded.
         // The user shouldn't do this. If they truly want to not output results, they should use stdout_null or stderr_null. If they
         // planned on capturing the data to a variable, they may want to add a function to the task which does this, instead.
@@ -309,19 +309,25 @@ impl Command {
         // Expression doesn't implement Display, and due to private fields there's no way to "discover" it's structure and create one, so Debug will have to do.
         println!("* {command:?}");
 
-        command.run()?;
+        command.run().map_err(CommandError::Process)?;
 
         Ok(())
+    }
+
+    fn run_function(function: &mut Rc<RefCell<dyn FnMut() -> Result<(), Box<dyn Error>>>>) -> Result<(), CommandError> {
+        println!("* function");
+        (function.try_borrow_mut()?)().map_err(CommandError::Function)
     }
 
     /// Runs the appropriate command. If `Err` is returned, the entire process will fail.
     pub fn run(&mut self) -> Result<(),CommandError> {
         match self {
-            Self::Function(function) => (function.try_borrow_mut()?)().map_err(CommandError::Function),
-            Self::Command(expression) => Self::run_process(expression).map_err(CommandError::Process)
+            Self::Function(function) => Self::run_function(function),
+            Self::Command(expression) => Self::run_process(expression)
         }
     }
 }
+
 
 
 #[allow(non_snake_case)] // gumdrop does not allow me to change the name of the positional argument "TASKS" field in help, so this is the only way to capitalize it. The allow tag will not work directly on the field, probably because of the derive trait.
