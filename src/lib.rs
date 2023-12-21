@@ -314,7 +314,7 @@ impl Command {
         Ok(())
     }
 
-    fn run_function(function: &mut Rc<RefCell<dyn FnMut() -> Result<(), Box<dyn Error>>>>) -> Result<(), CommandError> {
+    fn run_function(function: &mut Rc<RefCell<CommandFunction>>) -> Result<(), CommandError> {
         println!("* function");
         (function.try_borrow_mut()?)().map_err(CommandError::Function)
     }
@@ -517,8 +517,8 @@ impl Task {
             match hook {
                 Hook::Dependency(dependency) => self.dependency(dependency.clone()),
                 Hook::Command(command) => self.add_command(command.clone()),
-                Hook::Input(files) => self.input_checks(&files),
-                Hook::Output(files) => self.output_checks(&files)
+                Hook::Input(files) => self.input_checks(files),
+                Hook::Output(files) => self.output_checks(files)
             }
         }
 
@@ -570,7 +570,9 @@ impl Task {
     */
     pub fn must_skip(&self, trace: bool) -> Result<bool, std::io::Error> {
         if self.command.is_empty() {
-            println!("no commands on task, will skip.");
+            if trace {
+                println!("no commands on task, will skip.");
+            }
             Ok(true)
         } else {
             if trace {
