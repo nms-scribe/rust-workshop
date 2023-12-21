@@ -563,23 +563,28 @@ impl Task {
 
     */
     pub fn must_skip(&self, trace: bool) -> Result<bool, std::io::Error> {
-        if trace {
-            println!("checking max modified time for input.");
-        }
-        let source_time = get_max_modified_time_for(&self.input_file_checks,false, trace)?;
-        if trace {
-            println!("checking max modified time for output.");
-        }
-        let target_time = get_max_modified_time_for(&self.output_file_checks,true, trace)?;
-        let skip = source_time < target_time;
-        if trace {
-            if skip {
-                println!("source time is less than target time, will skip.")
-            } else {
-                println!("source time is not less than target time, will not skip.")
+        if self.command.is_empty() {
+            println!("no commands on task, will skip.");
+            Ok(true)
+        } else {
+            if trace {
+                println!("checking max modified time for input.");
             }
+            let source_time = get_max_modified_time_for(&self.input_file_checks,false, trace)?;
+            if trace {
+                println!("checking max modified time for output.");
+            }
+            let target_time = get_max_modified_time_for(&self.output_file_checks,true, trace)?;
+            let skip = source_time < target_time;
+            if trace {
+                if skip {
+                    println!("source time is less than target time, will skip.")
+                } else {
+                    println!("source time is not less than target time, will not skip.")
+                }
+            }
+            Ok(skip)
         }
-        Ok(skip)
     }
 
 
